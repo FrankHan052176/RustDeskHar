@@ -1,0 +1,67 @@
+name: Build HarmonyOS HAR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-har:
+    name: Build aarch64 HAR
+    runs-on: [self-hosted, linux]
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - name: Checkout submodules
+        shell: bash
+        run: |
+          if [[ -n "${LIBWEBM_GIT_MIRROR:-}" ]]; then
+            git config --global \
+              url."${LIBWEBM_GIT_MIRROR}".insteadOf \
+              "https://chromium.googlesource.com/webm/libwebm"
+          fi
+
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-ohos
+
+      - name: Check HarmonyOS SDK
+        shell: bash
+        run: |
+          if [[ -z "${OHOS_NDK_HOME:-}" ]]; then
+            echo "OHOS_NDK_HOME must be configured on the self-hosted runner." >&2
+            exit 2
+          fi
+          test -d "$OHOS_NDK_HOME/native/llvm/bin"
+
+      - name: Install ohrs
+        shell: bash
+        run: |
+          if ! command -v ohrs >/dev/null 2>&1; then
+            cargo install ohrs --locked
+          fi
+
+      - name: Build HAR
+        shell: bash
+        run: scripts/build-har.sh
+
+      - name: Upload HAR artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-native-har-aarch64
+          path: |
+            package.har
+            dist/**
+            package/libs/**
+          if-no-files-found: error

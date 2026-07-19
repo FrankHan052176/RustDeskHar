@@ -1,0 +1,4 @@
+[submodule "third_party/rustdesk"]
+	path = third_party/rustdesk
+	url = git@github.com:FrankHan052176/rustdesk4ohos.git
+	branch = main

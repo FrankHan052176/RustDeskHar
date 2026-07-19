@@ -1,0 +1,20 @@
+{
+  "license": "MIT",
+  "author": "FrankHan",
+  "name": "rustdesk-ohrs",
+  "description": "HarmonyOS native HAR bridge for RustDesk.",
+  "main": "index.ets",
+  "version": "0.1.0",
+  "types": "libs/index.d.ts",
+  "dependencies": {},
+  "compatibleSdkVersion": "12",
+  "compatibleSdkType": "HarmonyOS",
+  "obfuscated": false,
+  "nativeComponents": [
+    {
+      "name": "librustdesk_native_har.so",
+      "compatibleSdkVersion": "12",
+      "compatibleSdkType": "HarmonyOS"
+    }
+  ]
+}

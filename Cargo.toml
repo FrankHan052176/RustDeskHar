@@ -1,0 +1,26 @@
+[package]
+name    = "rustdesk_native_har"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi-ohos = { version = "1.0", default-features = false, features = [
+    "napi8",
+    "async",
+] }
+napi-derive-ohos = { version = "1.0" }
+rustdesk = { path = "../Core", features = ["flutter"] }
+serde_json = "1.0"
+log = "0.4"
+
+[build-dependencies]
+napi-build-ohos = { version = "1.0" }
+
+[profile.release]
+lto = true

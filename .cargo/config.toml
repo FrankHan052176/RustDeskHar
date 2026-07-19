@@ -1,0 +1,4 @@
+[env]
+PKG_CONFIG_ALLOW_CROSS = { value = "1", force = true }
+TARGET_CFLAGS = { value = "", force = true }
+TARGET_CXXFLAGS = { value = "", force = true }
