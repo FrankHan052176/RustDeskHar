@@ -10,7 +10,10 @@ fn main() {
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let rustdesk_root = manifest_dir.join("../Core");
+    // Keep the runtime capability metadata aligned with the actual Cargo path
+    // dependency used by this workspace. The previous ../Core probe made a
+    // fully linked build report that its RustDesk source snapshot was absent.
+    let rustdesk_root = manifest_dir.join("../R_RustDesk-Core");
     let hbb_common_dir = rustdesk_root.join("libs/hbb_common");
 
     println!("cargo:rerun-if-changed={}", rustdesk_root.display());
