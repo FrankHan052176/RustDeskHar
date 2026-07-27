@@ -37,7 +37,9 @@ export OHOS_NDK_HOME="$HOME/Huawei/Sdk/default/openharmony"
 scripts/build-har.sh
 ```
 
-The script exports the aarch64 OHOS toolchain variables and runs:
+The script exports the aarch64 OHOS toolchain variables, fetches the pinned
+upstream libvpx, libaom, libyuv, and libopus sources on first use, builds their
+static arm64 libraries with the OHOS NDK, and then runs:
 
 ```bash
 ohrs build --release -a aarch
@@ -45,6 +47,11 @@ ohrs artifact
 ```
 
 The final HAR artifact is generated at `package.har`.
+
+The source and build trees are cached below `target/`. Set
+`OHOS_LIBVPX_ROOT`, `OHOS_LIBAOM_ROOT`, `OHOS_LIBYUV_ROOT`, and
+`OHOS_LIBOPUS_ROOT` before invoking the script to reuse compatible prebuilt
+OHOS arm64 installations instead.
 
 ### Windows
 

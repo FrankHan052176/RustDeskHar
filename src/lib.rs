@@ -593,11 +593,11 @@ pub fn runtime_get_decoder_capabilities() -> String {
     json!({
       "buildMarker": BUILD_MARKER,
       "capabilities": [
-        query_decoder_capability("H264", MIME_VIDEO_AVC),
-        query_decoder_capability("H265", MIME_VIDEO_HEVC),
-        query_decoder_capability("AV1", MIME_VIDEO_AV1),
-        query_decoder_capability("VP9", MIME_VIDEO_VP9),
-        query_decoder_capability("VP8", MIME_VIDEO_VP8),
+        query_decoder_capability("H264", MIME_VIDEO_AVC, ""),
+        query_decoder_capability("H265", MIME_VIDEO_HEVC, ""),
+        query_decoder_capability("AV1", MIME_VIDEO_AV1, "libaom"),
+        query_decoder_capability("VP9", MIME_VIDEO_VP9, "libvpx"),
+        query_decoder_capability("VP8", MIME_VIDEO_VP8, "libvpx"),
       ]
     })
     .to_string()
@@ -614,6 +614,7 @@ pub fn runtime_init(app_dir: String, device_name: String) -> String {
     register_surface_lookup_once();
     register_core_callbacks();
     flutter_ffi::main_device_name(normalized_device_name.clone());
+    flutter_ffi::main_set_home_dir(app_dir.clone());
     flutter_ffi::main_init(app_dir.clone(), String::new());
     json!({
       "ok": true,
@@ -1067,7 +1068,8 @@ pub fn runtime_scan_lan_peers() -> String {
 
 #[napi]
 pub fn runtime_list_lan_peers() -> String {
-    let raw = flutter_ffi::main_get_lan_peers_full();
+    let raw = serde_json::to_string(&hbb_common::config::LanPeers::load().peers)
+        .unwrap_or_default();
     match parse_json_list(&raw, "LAN peer list") {
         Ok(peers) => {
             let peers = peers.iter().map(lan_peer_summary).collect::<Vec<_>>();
@@ -1950,11 +1952,23 @@ pub fn session_set_codec_preference(session_id: String, codec: String) -> String
             CODEC_PREFERENCE_OPTION.to_string(),
             normalized.clone(),
         );
-        flutter_ffi::session_change_prefer_codec(core_session_id);
+        // Before session_start the login request has not been created yet. The
+        // persisted peer option is enough to make the first request advertise
+        // the right decoder preference. Do not queue a standalone Misc before
+        // the IO loop starts; once the session is live, push the update so a
+        // user change can renegotiate an active stream.
+        let should_push_update = session.phase != "created";
+        if should_push_update {
+            flutter_ffi::session_change_prefer_codec(core_session_id);
+        }
         session.last_error = None;
         (
             true,
-            format!("Updated RustDesk codec preference to {}", normalized),
+            if should_push_update {
+                format!("Updated RustDesk codec preference to {}", normalized)
+            } else {
+                format!("Prepared RustDesk codec preference for first login: {}", normalized)
+            },
         )
     })
 }
@@ -2107,26 +2121,25 @@ pub fn session_send_clipboard(session_id: String, content: String) -> String {
                 "Clipboard is only available for remote-control sessions".to_string(),
             );
         }
-        let Some(core_session_id) = parse_core_session_id(session) else {
+        let Some(_core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
         #[cfg(target_env = "ohos")]
         {
-            match flutter_ffi::session_send_text_clipboard(core_session_id, content.clone()) {
-                Ok(()) => {
-                    session.last_error = None;
-                    (true, "Forwarded text clipboard to RustDesk".to_string())
-                }
-                Err(error) => {
-                    let message = error.to_string();
-                    session.last_error = Some(message.clone());
-                    (false, message)
-                }
+            if ohos::update_client_text_clipboard(content.clone()) {
+                session.last_error = None;
+                (true, "Queued text clipboard for RustDesk".to_string())
+            } else {
+                let message =
+                    "Clipboard synchronization is disabled by the current session permissions"
+                        .to_string();
+                session.last_error = Some(message.clone());
+                (false, message)
             }
         }
         #[cfg(not(target_env = "ohos"))]
         {
-            let _ = (core_session_id, &content);
+            let _ = (&_core_session_id, &content);
             (
                 false,
                 "Clipboard bridge is only available on HarmonyOS".to_string(),
@@ -4337,7 +4350,7 @@ fn build_hbb_common_present() -> bool {
     BUILD_HBB_COMMON_PRESENT == "true"
 }
 
-fn query_decoder_capability(label: &str, mime: &[u8]) -> Value {
+fn query_decoder_capability(label: &str, mime: &[u8], bundled_software_name: &str) -> Value {
     let mime = mime.as_ptr().cast::<c_char>();
     let mime_string = unsafe { CStr::from_ptr(mime).to_string_lossy().into_owned() };
     let recommended = unsafe { OH_AVCodec_GetCapability(mime, false) };
@@ -4345,6 +4358,12 @@ fn query_decoder_capability(label: &str, mime: &[u8]) -> Value {
         unsafe { OH_AVCodec_GetCapabilityByCategory(mime, false, OH_AVCodecCategory::Hardware) };
     let software =
         unsafe { OH_AVCodec_GetCapabilityByCategory(mime, false, OH_AVCodecCategory::Software) };
+    let platform_software_name = capability_name(software);
+    let software_name = if platform_software_name.is_empty() {
+        bundled_software_name.to_string()
+    } else {
+        platform_software_name
+    };
     log::info!(
         "OHOS capability query codec={} mime={} recommended={:p} hardware={:p} software={:p}",
         label,
@@ -4362,8 +4381,8 @@ fn query_decoder_capability(label: &str, mime: &[u8]) -> Value {
       "recommendedIsHardware": capability_is_hardware(recommended),
       "hardwareAvailable": !hardware.is_null(),
       "hardwareName": capability_name(hardware),
-      "softwareAvailable": !software.is_null(),
-      "softwareName": capability_name(software)
+      "softwareAvailable": !software.is_null() || !bundled_software_name.is_empty(),
+      "softwareName": software_name
     })
 }
 

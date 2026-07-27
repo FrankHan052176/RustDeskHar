@@ -5,6 +5,10 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 source "$repo_root/scripts/ohos-env.sh"
+"$repo_root/scripts/build-libvpx-ohos.sh"
+"$repo_root/scripts/build-libaom-ohos.sh"
+"$repo_root/scripts/build-libyuv-ohos.sh"
+"$repo_root/scripts/build-libopus-ohos.sh"
 
 clear_native_outputs() {
   local include_target="${1:-false}"

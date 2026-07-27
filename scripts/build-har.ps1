@@ -174,6 +174,33 @@ $env:CXXFLAGS_aarch64_unknown_linux_ohos = if ($env:CXXFLAGS_aarch64_unknown_lin
 $env:BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos = if ($env:BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos) { $env:BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos } else { $commonFlags }
 $env:PKG_CONFIG_ALLOW_CROSS = if ($env:PKG_CONFIG_ALLOW_CROSS) { $env:PKG_CONFIG_ALLOW_CROSS } else { '1' }
 $env:CC_SHELL_ESCAPED_FLAGS = if ($env:CC_SHELL_ESCAPED_FLAGS) { $env:CC_SHELL_ESCAPED_FLAGS } else { '1' }
+$env:VCPKG_ROOT = if ($env:VCPKG_ROOT) {
+  $env:VCPKG_ROOT
+} else {
+  Join-Path $RepoRoot 'target\ohos-vcpkg'
+}
+$env:VCPKG_INSTALLED_ROOT = if ($env:VCPKG_INSTALLED_ROOT) {
+  $env:VCPKG_INSTALLED_ROOT
+} else {
+  Join-Path $env:VCPKG_ROOT 'installed'
+}
+$env:OHOS_VCPKG_PREFIX = if ($env:OHOS_VCPKG_PREFIX) {
+  $env:OHOS_VCPKG_PREFIX
+} else {
+  Join-Path $env:VCPKG_INSTALLED_ROOT 'arm64-linux'
+}
+$env:OHOS_LIBVPX_ROOT = if ($env:OHOS_LIBVPX_ROOT) {
+  $env:OHOS_LIBVPX_ROOT
+} else {
+  $env:OHOS_VCPKG_PREFIX
+}
+$env:OHOS_LIBAOM_ROOT = if ($env:OHOS_LIBAOM_ROOT) {
+  $env:OHOS_LIBAOM_ROOT
+} else {
+  $env:OHOS_VCPKG_PREFIX
+}
+$env:OHOS_LIBYUV_ROOT = if ($env:OHOS_LIBYUV_ROOT) { $env:OHOS_LIBYUV_ROOT } else { $env:OHOS_VCPKG_PREFIX }
+$env:OHOS_LIBOPUS_ROOT = if ($env:OHOS_LIBOPUS_ROOT) { $env:OHOS_LIBOPUS_ROOT } else { $env:OHOS_VCPKG_PREFIX }
 
 $rustFlagsSeparator = [string][char]0x1f
 $encodedRustFlags = $rustFlags -join $rustFlagsSeparator
@@ -187,6 +214,27 @@ if (-not (Get-Command ohrs -ErrorAction SilentlyContinue)) {
   throw 'ohrs was not found in PATH. Install it with: cargo install ohrs --locked'
 }
 
+$bash = Get-Command bash -ErrorAction SilentlyContinue
+if (-not $bash) {
+  throw 'bash was not found. Git for Windows is required to build the pinned upstream codec dependencies.'
+}
+& $bash.Source (Join-Path $RepoRoot 'scripts\build-libvpx-ohos.sh')
+if ($LASTEXITCODE -ne 0) {
+  throw "OHOS libvpx build failed with exit code $LASTEXITCODE."
+}
+& $bash.Source (Join-Path $RepoRoot 'scripts\build-libaom-ohos.sh')
+if ($LASTEXITCODE -ne 0) {
+  throw "OHOS libaom build failed with exit code $LASTEXITCODE."
+}
+& $bash.Source (Join-Path $RepoRoot 'scripts\build-libyuv-ohos.sh')
+if ($LASTEXITCODE -ne 0) {
+  throw "OHOS libyuv build failed with exit code $LASTEXITCODE."
+}
+& $bash.Source (Join-Path $RepoRoot 'scripts\build-libopus-ohos.sh')
+if ($LASTEXITCODE -ne 0) {
+  throw "OHOS libopus build failed with exit code $LASTEXITCODE."
+}
+
 $nativeLib = Join-Path $RepoRoot 'target\aarch64-unknown-linux-ohos\release\librustdesk_native_har.so'
 $distLib = Join-Path $RepoRoot 'dist\arm64-v8a\librustdesk_native_har.so'
 $buildStartedAt = Get-Date
@@ -196,6 +244,7 @@ Clear-NativeOutputs -IncludeTarget
 Write-Host "OHOS_NDK_HOME=$env:OHOS_NDK_HOME"
 Write-Host "OHOS target=$TargetTriple"
 Write-Host "OHOS linker=$env:CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER"
+Write-Host "OHOS vcpkg prefix=$env:OHOS_VCPKG_PREFIX"
 Write-Host "CARGO_BUILD_JOBS=$env:CARGO_BUILD_JOBS"
 Write-Host "MAKEFLAGS=$env:MAKEFLAGS"
 
