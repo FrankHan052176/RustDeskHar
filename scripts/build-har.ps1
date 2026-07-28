@@ -237,6 +237,8 @@ if ($LASTEXITCODE -ne 0) {
 
 $nativeLib = Join-Path $RepoRoot 'target\aarch64-unknown-linux-ohos\release\librustdesk_native_har.so'
 $distLib = Join-Path $RepoRoot 'dist\arm64-v8a\librustdesk_native_har.so'
+$cxxRuntime = Join-Path $env:OHOS_NDK_HOME 'native\llvm\lib\aarch64-linux-ohos\libc++_shared.so'
+$distCxxRuntime = Join-Path $RepoRoot 'dist\arm64-v8a\libc++_shared.so'
 $buildStartedAt = Get-Date
 
 Clear-NativeOutputs -IncludeTarget
@@ -258,6 +260,10 @@ if (-not (Test-Path -LiteralPath $nativeLib)) {
   throw "ohrs build did not produce $nativeLib."
 }
 
+if (-not (Test-Path -LiteralPath $cxxRuntime)) {
+  throw "OHOS arm64 C++ runtime was not found: $cxxRuntime."
+}
+
 $nativeLibInfo = Get-Item -LiteralPath $nativeLib
 if ($nativeLibInfo.LastWriteTime -lt $buildStartedAt.AddSeconds(-1)) {
   throw "ohrs build did not refresh $nativeLib. Refusing to package a stale native library."
@@ -271,6 +277,8 @@ $distLibInfo = Get-Item -LiteralPath $distLib
 if ($distLibInfo.LastWriteTime -lt $buildStartedAt.AddSeconds(-1)) {
   throw "ohrs build did not refresh $distLib. Refusing to package a stale native library."
 }
+
+Copy-Item -LiteralPath $cxxRuntime -Destination $distCxxRuntime -Force
 
 Write-Host 'Packaging HAR...'
 Clear-NativeOutputs

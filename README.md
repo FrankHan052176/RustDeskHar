@@ -82,7 +82,11 @@ ohrs artifact
 
 `libsodium-sys` is intentionally single-threaded on `windows + linux-ohos` in the RustDesk fork because Git-for-Windows/MSYS libtool can race when producing intermediate archives. A clean Windows build can therefore spend a long quiet period in `libsodium-sys`; this is expected as long as object timestamps keep advancing.
 
-Only `arm64-v8a` is packaged. The build scripts clear stale `x86`, `x86_64`, and `armeabi-v7a` directories from both `dist` and `package/libs` before `ohrs artifact`, and they refuse to package a HAR if the arm64 native library was not refreshed by the current build.
+Only `arm64-v8a` is packaged. The build scripts include the SDK-provided arm64
+`libc++_shared.so` runtime required by `librustdesk_native_har.so`, clear stale
+`x86`, `x86_64`, and `armeabi-v7a` directories from both `dist` and
+`package/libs` before `ohrs artifact`, and refuse to package a HAR if the arm64
+native library was not refreshed by the current build.
 
 ### Linux and macOS
 

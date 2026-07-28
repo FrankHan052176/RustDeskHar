@@ -36,6 +36,8 @@ fi
 
 native_lib="$repo_root/target/aarch64-unknown-linux-ohos/release/librustdesk_native_har.so"
 dist_lib="$repo_root/dist/arm64-v8a/librustdesk_native_har.so"
+cxx_runtime="$OHOS_NDK_HOME/native/llvm/lib/aarch64-linux-ohos/libc++_shared.so"
+dist_cxx_runtime="$repo_root/dist/arm64-v8a/libc++_shared.so"
 type_definition="$repo_root/types/index.d.ts"
 dist_type_definition="$repo_root/dist/index.d.ts"
 
@@ -43,6 +45,11 @@ clear_native_outputs true
 
 if [[ ! -f "$type_definition" ]]; then
   echo "Missing NAPI type declaration: $type_definition" >&2
+  exit 1
+fi
+
+if [[ ! -f "$cxx_runtime" ]]; then
+  echo "Missing OHOS arm64 C++ runtime: $cxx_runtime" >&2
   exit 1
 fi
 
@@ -56,6 +63,7 @@ fi
 
 mkdir -p "$(dirname "$dist_lib")"
 cp "$native_lib" "$dist_lib"
+cp "$cxx_runtime" "$dist_cxx_runtime"
 cp "$type_definition" "$dist_type_definition"
 
 echo "Packaging HAR..."
