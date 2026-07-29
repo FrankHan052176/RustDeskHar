@@ -836,6 +836,10 @@ export function sessionStart(sessionId: string): string {
   return native.sessionStart(sessionId);
 }
 
+export function sessionSetViewOnly(sessionId: string, enabled: boolean): string {
+  return native.sessionSetViewOnly(sessionId, enabled);
+}
+
 export function sessionSwitchDisplay(sessionId: string, displaysJson: string): string {
   return native.sessionSwitchDisplay(sessionId, displaysJson);
 }

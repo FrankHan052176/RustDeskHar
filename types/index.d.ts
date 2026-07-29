@@ -419,6 +419,8 @@ export declare function sessionSetViewStyle(sessionId: string, value: string): v
 
 export declare function sessionStart(sessionId: string): string
 
+export declare function sessionSetViewOnly(sessionId: string, enabled: boolean): string
+
 export declare function sessionSwitchDisplay(sessionId: string, displaysJson: string): string
 
 export declare function sessionTakeRgbaFrame(sessionId: string, display: number): Uint8Array

@@ -151,6 +151,7 @@ const NATIVE_PACKAGE_NAME: &str = "rustdesk-ohrs";
 const CORE_BLOCKER_MESSAGE: &str = "RustDesk core session calls are available, but Harmony-specific event and frame delivery are still incomplete.";
 const REAL_SESSION_BINDING_IMPLEMENTED: bool = true;
 const SHOW_REMOTE_CURSOR_OPTION: &str = "show-remote-cursor";
+const VIEW_ONLY_OPTION: &str = "view-only";
 const CODEC_PREFERENCE_OPTION: &str = "codec-preference";
 const ADDRESS_BOOK_SUPERSEDED_MESSAGE: &str = "Server or account changed while synchronizing";
 const BUILD_RUSTDESK_SNAPSHOT_PRESENT: &str = env!("BUILD_RUSTDESK_SNAPSHOT_PRESENT");
@@ -288,6 +289,7 @@ struct BridgeSession {
     relay_suffix_requested: bool,
     force_relay: bool,
     conn_type: String,
+    view_only: bool,
     phase: String,
     last_action: String,
     last_error: Option<String>,
@@ -1589,6 +1591,8 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
     let force_relay = json_bool(&options, &["forceRelay", "force_relay"]);
     let normalized = normalize_target(&peer_target, force_relay);
     let conn_type = connection_type_from_options(&options).to_string();
+    let view_only = conn_type == "default_conn"
+        && json_bool(&options, &["isViewOnly", "is_view_only", "viewOnly", "view_only"]);
 
     let mut sessions = session_store().lock().unwrap();
     if sessions.contains_key(&resolved_session_id) {
@@ -1632,6 +1636,24 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
         );
     }
 
+    // `view-only` is a normal desktop session option rather than a separate
+    // RustDesk connection type. Set it before the IO loop starts so the first
+    // LoginRequest already disables keyboard, clipboard and file operations.
+    // Always restore the requested value because RustDesk persists peer
+    // options and a previous viewer session must not make a later control
+    // session accidentally read-only.
+    let current_view_only = flutter_ffi::session_get_toggle_option(
+        core_session_id.clone(),
+        VIEW_ONLY_OPTION.to_string(),
+    )
+    .unwrap_or(false);
+    if current_view_only != view_only {
+        flutter_ffi::session_toggle_option(
+            core_session_id.clone(),
+            VIEW_ONLY_OPTION.to_string(),
+        );
+    }
+
     let session = BridgeSession {
         session_id: resolved_session_id.clone(),
         core_session_id: Some(core_session_id.to_string()),
@@ -1642,6 +1664,7 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
         relay_suffix_requested: normalized.relay_suffix_requested,
         force_relay: normalized.effective_force_relay,
         conn_type,
+        view_only,
         phase: "created".to_string(),
         last_action: "session_add".to_string(),
         last_error: None,
@@ -1696,6 +1719,48 @@ pub fn session_start(session_id: String) -> String {
                 (false, message)
             }
         }
+    })
+}
+
+/// Set the desktop viewer policy for an existing session.
+///
+/// The flag is deliberately exposed as a setter instead of making callers
+/// toggle the generic RustDesk option. This keeps the bridge state and the
+/// persisted peer option in sync, and gives the bridge a single place to
+/// enforce the no-input policy below.
+#[napi]
+pub fn session_set_view_only(session_id: String, enabled: bool) -> String {
+    update_session(&session_id, "session_set_view_only", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        if session.conn_type != "default_conn" {
+            return (
+                false,
+                "View-only is only available for remote desktop sessions".to_string(),
+            );
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        let current = flutter_ffi::session_get_toggle_option(
+            core_session_id.clone(),
+            VIEW_ONLY_OPTION.to_string(),
+        )
+        .unwrap_or(false);
+        if current != enabled {
+            flutter_ffi::session_toggle_option(core_session_id, VIEW_ONLY_OPTION.to_string());
+        }
+        session.view_only = enabled;
+        session.last_error = None;
+        (
+            true,
+            if enabled {
+                "Remote desktop viewer mode enabled".to_string()
+            } else {
+                "Remote desktop control mode enabled".to_string()
+            },
+        )
     })
 }
 
@@ -1869,6 +1934,9 @@ pub fn session_send_pointer(session_id: String, pointer_json: String) -> String 
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "Input is disabled for a view-only session".to_string());
+        }
         session.last_pointer_payload = Some(pointer_json.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -1884,6 +1952,9 @@ pub fn session_send_mouse(session_id: String, mouse_json: String) -> String {
     update_session(&session_id, "session_send_mouse", |session| {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
+        }
+        if session.view_only {
+            return (false, "Input is disabled for a view-only session".to_string());
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -1979,6 +2050,9 @@ pub fn session_input_key(session_id: String, key_json: String) -> String {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "Input is disabled for a view-only session".to_string());
+        }
         session.last_key_payload = Some(key_json.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2027,6 +2101,9 @@ pub fn session_handle_flutter_key_event(session_id: String, key_json: String) ->
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "Input is disabled for a view-only session".to_string());
+        }
         session.last_key_payload = Some(key_json.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2071,6 +2148,9 @@ pub fn session_enter_or_leave(session_id: String, enter: bool) -> String {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "Keyboard capture is disabled for a view-only session".to_string());
+        }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
@@ -2099,6 +2179,9 @@ pub fn session_input_string(session_id: String, value: String) -> String {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "Input is disabled for a view-only session".to_string());
+        }
         session.last_text_payload = Some(value.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2114,6 +2197,12 @@ pub fn session_send_clipboard(session_id: String, content: String) -> String {
     update_session(&session_id, "session_send_clipboard", |session| {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
+        }
+        if session.view_only {
+            return (
+                false,
+                "Clipboard is disabled for a view-only session".to_string(),
+            );
         }
         if session.conn_type != "default_conn" {
             return (
@@ -2154,6 +2243,9 @@ pub fn session_send_chat(session_id: String, text: String) -> String {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "Chat is disabled for a view-only session".to_string());
+        }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
@@ -2161,6 +2253,24 @@ pub fn session_send_chat(session_id: String, text: String) -> String {
         session.last_error = None;
         (true, "Forwarded chat message to RustDesk".to_string())
     })
+}
+
+#[napi]
+pub fn session_send_note(session_id: String, note: String) {
+    let _ = update_session(&session_id, "session_send_note", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        if session.view_only {
+            return (false, "Notes are disabled for a view-only session".to_string());
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        flutter_ffi::session_send_note(core_session_id, note.clone());
+        session.last_error = None;
+        (true, "Forwarded session note to RustDesk".to_string())
+    });
 }
 
 #[napi]
@@ -2258,6 +2368,12 @@ pub fn session_change_resolution(
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (
+                false,
+                "Remote resolution changes are disabled for a view-only session".to_string(),
+            );
+        }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
@@ -2344,12 +2460,51 @@ pub fn session_toggle_option(session_id: String, option: String) {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if option == VIEW_ONLY_OPTION {
+            return (
+                false,
+                "Use session_set_view_only so the bridge policy stays synchronized".to_string(),
+            );
+        }
+        if session.view_only {
+            return (
+                false,
+                "Generic option changes are disabled for a view-only session".to_string(),
+            );
+        }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
         flutter_ffi::session_toggle_option(core_session_id, option.clone());
         session.last_error = None;
         (true, format!("Toggled RustDesk option {}", option))
+    });
+}
+
+#[napi]
+pub fn session_peer_option(session_id: String, name: String, value: String) {
+    let _ = update_session(&session_id, "session_peer_option", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        if name == VIEW_ONLY_OPTION {
+            return (
+                false,
+                "Use session_set_view_only so the bridge policy stays synchronized".to_string(),
+            );
+        }
+        if session.view_only {
+            return (
+                false,
+                "Peer option changes are disabled for a view-only session".to_string(),
+            );
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        flutter_ffi::session_peer_option(core_session_id, name.clone(), value.clone());
+        session.last_error = None;
+        (true, format!("Updated RustDesk peer option {}", name))
     });
 }
 
@@ -2416,6 +2571,9 @@ pub fn session_read_remote_dir(session_id: String, path: String, include_hidden:
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
         }
+        if session.view_only {
+            return (false, "File access is disabled for a view-only session".to_string());
+        }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
@@ -2439,6 +2597,9 @@ pub fn session_send_files(
     update_session(&session_id, "session_send_files", |session| {
         if session.phase == "closed" {
             return (false, "Session is closed".to_string());
+        }
+        if session.view_only {
+            return (false, "File transfer is disabled for a view-only session".to_string());
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2473,6 +2634,9 @@ pub fn session_set_confirm_override_file(
         |session| {
             if session.phase == "closed" {
                 return (false, "Session is closed".to_string());
+            }
+            if session.view_only {
+                return (false, "File transfer is disabled for a view-only session".to_string());
             }
             let Some(core_session_id) = parse_core_session_id(session) else {
                 return (false, "Missing core session id".to_string());
@@ -2509,6 +2673,14 @@ pub fn session_cancel_job(session_id: String, act_id: i32) -> String {
                 "session_cancel_job",
                 false,
                 "Session is closing or closed".to_string(),
+                Some(session),
+            );
+        }
+        if session.view_only {
+            return action_response(
+                "session_cancel_job",
+                false,
+                "File transfer is disabled for a view-only session".to_string(),
                 Some(session),
             );
         }
@@ -2773,6 +2945,7 @@ fn session_value(session: &BridgeSession) -> Value {
       "relaySuffixRequested": session.relay_suffix_requested,
       "forceRelay": session.force_relay,
       "connType": session.conn_type,
+      "viewOnly": session.view_only,
       "phase": session.phase,
       "lastAction": session.last_action,
       "lastError": session.last_error,
