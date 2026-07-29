@@ -123,6 +123,7 @@ jobs:
           CORE_SHA: ${{ needs.source.outputs.sha }}
         run: |
           set -euo pipefail
+          git -C R_RustDesk-Core fetch --force --tags https://github.com/rustdesk/rustdesk.git
           cargo_version="$(awk -F '"' '/^version[[:space:]]*=[[:space:]]*"/ { print $2; exit }' R_RustDesk-Core/Cargo.toml)"
           last_tag="$(git -C R_RustDesk-Core describe --tags --abbrev=0 \
             --match '[0-9]*.[0-9]*.[0-9]*' \
