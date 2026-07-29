@@ -1,0 +1,467 @@
+name: Build and publish RustDesk HAR
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || 'publish' }}
+  # A main push or manual recovery must preempt a stale scheduled poll. A
+  # schedule never cancels an active publish; once it runs, the latest check
+  # will observe the completed push and skip the duplicate Core SHA.
+  cancel-in-progress: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  OHOS_COMMAND_LINE_TOOLS_VERSION: 6.1.1.280
+  OHRS_VERSION: 1.3.1
+  PACKAGE_NAME: rustdesk-ohrs
+  CORE_REPOSITORY: ${{ vars.CORE_REPOSITORY || 'FrankHan052176/rustdesk4ohos' }}
+  CORE_BRANCH: ${{ vars.CORE_REF || 'master' }}
+  ARKTS_REPOSITORY: ${{ vars.ARKTS_REPOSITORY || 'FrankHan052176/RustDesk-ArkTS' }}
+  CODEARTS_OHPM_REGISTRY: https://devrepo.devcloud.cn-north-4.huaweicloud.com/artgalaxy/api/ohpm/cn-north-4_c07b1b38744f424b8d87a86532d38003_ohpm_1/
+
+jobs:
+  resolve_source:
+    name: Resolve RustDesk Core source
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-22.04
+    outputs:
+      core_repository: ${{ steps.source.outputs.core_repository }}
+      core_sha: ${{ steps.source.outputs.core_sha }}
+      source_ref: ${{ steps.source.outputs.source_ref }}
+      source_url: ${{ steps.source.outputs.source_url }}
+    steps:
+      - name: Resolve immutable Core commit
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$CORE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid Core repository: $CORE_REPOSITORY" >&2
+            exit 2
+          fi
+          if [[ ! "$CORE_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] || \
+             [[ "$CORE_BRANCH" == *".."* ]] || [[ "$CORE_BRANCH" == *"//"* ]]; then
+            echo "Invalid Core branch: $CORE_BRANCH" >&2
+            exit 2
+          fi
+
+          encoded_ref="$(jq -rn --arg value "$CORE_BRANCH" '$value | @uri')"
+          core_sha="$(curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$CORE_REPOSITORY/commits/$encoded_ref" \
+            | jq -r '.sha // empty')"
+          if [[ ! "$core_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "Unable to resolve $CORE_REPOSITORY@$CORE_BRANCH to a commit." >&2
+            exit 2
+          fi
+
+          echo "core_repository=$CORE_REPOSITORY" >> "$GITHUB_OUTPUT"
+          echo "core_sha=${core_sha,,}" >> "$GITHUB_OUTPUT"
+          echo "source_ref=refs/heads/$CORE_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "source_url=$GITHUB_SERVER_URL/$CORE_REPOSITORY/commit/${core_sha,,}" >> "$GITHUB_OUTPUT"
+
+  poll_core:
+    name: Check scheduled Core update
+    needs: resolve_source
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-22.04
+    outputs:
+      should_build: ${{ steps.freshness.outputs.should_build }}
+    steps:
+      - name: Set up HarmonyOS CLI tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2
+        with:
+          version: ${{ env.OHOS_COMMAND_LINE_TOOLS_VERSION }}
+          cache: true
+
+      - name: Compare Core commit with private OHPM latest
+        id: freshness
+        shell: bash
+        env:
+          CODEARTS_PRIVATE_OHPM: ${{ secrets.CODEARTS_PRIVATE_OHPM }}
+          CORE_SHA: ${{ needs.resolve_source.outputs.core_sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CODEARTS_PRIVATE_OHPM:-}" ]]; then
+            echo "CODEARTS_PRIVATE_OHPM is not configured." >&2
+            exit 2
+          fi
+
+          private_config="$HOME/.ohpm/.ohpmrc"
+          mkdir -p "$(dirname "$private_config")"
+          umask 077
+          printf '%s' "$CODEARTS_PRIVATE_OHPM" > "$private_config"
+          trap 'rm -f "$private_config"' EXIT
+
+          latest_version=""
+          tags_file="$RUNNER_TEMP/rustdesk-ohpm-dist-tags.txt"
+          if NO_COLOR=1 ohpm dist-tags list "$PACKAGE_NAME" \
+            --registry "$CODEARTS_OHPM_REGISTRY" > "$tags_file"; then
+            latest_version="$(awk '$1 == "latest:" { print $2; exit }' "$tags_file")"
+          fi
+
+          expected_suffix="-g${CORE_SHA:0:8}"
+          if [[ -n "$latest_version" && "$latest_version" == *"$expected_suffix" ]]; then
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            echo "Core $CORE_SHA is already published as $PACKAGE_NAME@$latest_version."
+          else
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "Core $CORE_SHA is newer than private OHPM latest ${latest_version:-<none>}."
+          fi
+
+  build_har:
+    name: Build arm64 HarmonyOS HAR
+    needs: [resolve_source, poll_core]
+    if: >-
+      ${{
+        always() &&
+        needs.resolve_source.result == 'success' &&
+        (
+          github.event_name != 'schedule' ||
+          (
+            needs.poll_core.result == 'success' &&
+            needs.poll_core.outputs.should_build == 'true'
+          )
+        )
+      }}
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      core_version: ${{ steps.package.outputs.core_version }}
+      core_commit_count: ${{ steps.package.outputs.core_commit_count }}
+      har_sha: ${{ steps.package.outputs.har_sha }}
+      sha256: ${{ steps.artifact.outputs.sha256 }}
+    steps:
+      - name: Checkout HAR source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: R_RustDesk-Har
+          persist-credentials: false
+
+      - name: Checkout exact RustDesk Core source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ needs.resolve_source.outputs.core_repository }}
+          ref: ${{ needs.resolve_source.outputs.core_sha }}
+          path: R_RustDesk-Core
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Resolve package metadata
+        id: package
+        shell: bash
+        env:
+          EXPECTED_CORE_SHA: ${{ needs.resolve_source.outputs.core_sha }}
+          CORE_SOURCE_URL: ${{ needs.resolve_source.outputs.source_url }}
+        run: |
+          set -euo pipefail
+
+          core_sha="$(git -C R_RustDesk-Core rev-parse HEAD)"
+          har_sha="$(git -C R_RustDesk-Har rev-parse HEAD)"
+          if [[ "${core_sha,,}" != "${EXPECTED_CORE_SHA,,}" ]]; then
+            echo "Checked-out Core SHA $core_sha does not match $EXPECTED_CORE_SHA." >&2
+            exit 2
+          fi
+
+          cargo_version="$(awk -F '"' \
+            '/^version[[:space:]]*=[[:space:]]*"/ { print $2; exit }' \
+            R_RustDesk-Core/Cargo.toml)"
+          if [[ ! "$cargo_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Core Cargo version must be plain SemVer: $cargo_version" >&2
+            exit 2
+          fi
+
+          last_tag="$(git -C R_RustDesk-Core describe --tags --abbrev=0 \
+            --match '[0-9]*.[0-9]*.[0-9]*' \
+            --match 'v[0-9]*.[0-9]*.[0-9]*' \
+            HEAD 2>/dev/null || true)"
+          if [[ -n "$last_tag" && ! "$last_tag" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Nearest matched Core tag is not semantic: $last_tag" >&2
+            exit 2
+          fi
+
+          version_gt() {
+            [[ "$(printf '%s\n' "$1" "$2" | sort -V | tail -n 1)" == "$1" && "$1" != "$2" ]]
+          }
+
+          if [[ -z "$last_tag" ]]; then
+            core_version="$cargo_version"
+            core_commit_count="0"
+          else
+            tag_version="${last_tag#v}"
+            if version_gt "$cargo_version" "$tag_version"; then
+              core_version="$cargo_version"
+            else
+              core_version="$tag_version"
+            fi
+            core_commit_count="$(git -C R_RustDesk-Core rev-list --count "$last_tag..HEAD")"
+          fi
+
+          if [[ ! "$core_commit_count" =~ ^[0-9]+$ ]]; then
+            echo "Invalid Core commit count: $core_commit_count" >&2
+            exit 2
+          fi
+
+          short_core_sha="${core_sha:0:8}"
+          package_version="${core_version}-${core_commit_count}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-g${short_core_sha}"
+          generated_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          action_run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          jq --arg version "$package_version" \
+             --arg core_sha "$core_sha" \
+             '.version = $version |
+              .description = ("HarmonyOS native HAR bridge for RustDesk Core " + $core_sha + ".")' \
+             R_RustDesk-Har/package/oh-package.json5 \
+             > R_RustDesk-Har/package/oh-package.ci.json5
+          mv R_RustDesk-Har/package/oh-package.ci.json5 \
+             R_RustDesk-Har/package/oh-package.json5
+
+          printf '%s\n\n%s\n%s\n%s\n%s\n' \
+            "## $PACKAGE_NAME $package_version" \
+            "- Core version: $core_version" \
+            "- Core commit: $core_sha" \
+            "- HAR source commit: $har_sha" \
+            "- Generated by: $action_run_url" \
+            > R_RustDesk-Har/package/CHANGELOG.md
+
+          jq -n \
+            --arg package_name "$PACKAGE_NAME" \
+            --arg package_version "$package_version" \
+            --arg core_repository "${{ needs.resolve_source.outputs.core_repository }}" \
+            --arg core_ref "${{ needs.resolve_source.outputs.source_ref }}" \
+            --arg core_version "$core_version" \
+            --arg core_commit_count "$core_commit_count" \
+            --arg core_sha "$core_sha" \
+            --arg har_repository "$GITHUB_REPOSITORY" \
+            --arg har_sha "$har_sha" \
+            --arg core_source_url "$CORE_SOURCE_URL" \
+            --arg action_run_url "$action_run_url" \
+            --arg generated_at "$generated_at" \
+            '{
+              schemaVersion: 1,
+              packageName: $package_name,
+              packageVersion: $package_version,
+              coreRepository: $core_repository,
+              coreRef: $core_ref,
+              coreVersion: $core_version,
+              coreCommitCount: $core_commit_count,
+              coreCommit: $core_sha,
+              harRepository: $har_repository,
+              harCommit: $har_sha,
+              coreSourceUrl: $core_source_url,
+              actionRunUrl: $action_run_url,
+              generatedAt: $generated_at
+            }' > R_RustDesk-Har/package/BUILD_PROVENANCE.json
+
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+          echo "core_version=$core_version" >> "$GITHUB_OUTPUT"
+          echo "core_commit_count=$core_commit_count" >> "$GITHUB_OUTPUT"
+          echo "har_sha=$har_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Install native build prerequisites
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes cmake git make ninja-build perl
+
+      - name: Set up HarmonyOS CLI tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2
+        with:
+          version: ${{ env.OHOS_COMMAND_LINE_TOOLS_VERSION }}
+          cache: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          targets: aarch64-unknown-linux-ohos
+          components: ''
+
+      - name: Install pinned ohrs packager
+        shell: bash
+        run: cargo install ohrs --version "$OHRS_VERSION" --locked
+
+      - name: Build HarmonyOS HAR
+        shell: bash
+        run: bash R_RustDesk-Har/scripts/build-har.sh
+
+      - name: Verify and hash HAR
+        id: artifact
+        shell: bash
+        env:
+          EXPECTED_VERSION: ${{ steps.package.outputs.version }}
+          EXPECTED_CORE_SHA: ${{ needs.resolve_source.outputs.core_sha }}
+        run: |
+          set -euo pipefail
+
+          har_path="R_RustDesk-Har/package.har"
+          test -s "$har_path"
+          tar -tzf "$har_path" | rg -q '^package/libs/arm64-v8a/librustdesk_native_har\.so$'
+          tar -tzf "$har_path" | rg -q '^package/libs/arm64-v8a/libc\+\+_shared\.so$'
+
+          packaged_version="$(tar -xOzf "$har_path" package/oh-package.json5 | jq -r '.version')"
+          packaged_core_sha="$(tar -xOzf "$har_path" package/BUILD_PROVENANCE.json | jq -r '.coreCommit')"
+          test "$packaged_version" = "$EXPECTED_VERSION"
+          test "$packaged_core_sha" = "$EXPECTED_CORE_SHA"
+
+          har_sha256="$(sha256sum "$har_path" | awk '{print $1}')"
+          jq --arg har_sha256 "$har_sha256" \
+             '. + { harSha256: $har_sha256 }' \
+             R_RustDesk-Har/package/BUILD_PROVENANCE.json \
+             > R_RustDesk-Har/release-metadata.json
+
+          echo "sha256=$har_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload immutable HAR artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rustdesk-ohos-har-${{ steps.package.outputs.version }}
+          path: |
+            R_RustDesk-Har/package.har
+            R_RustDesk-Har/release-metadata.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish_har:
+    name: Publish latest and notify ArkTS
+    needs: [resolve_source, poll_core, build_har]
+    if: >-
+      ${{
+        always() &&
+        github.event_name != 'pull_request' &&
+        needs.build_har.result == 'success'
+      }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download built HAR
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: rustdesk-ohos-har-${{ needs.build_har.outputs.version }}
+          path: release
+
+      - name: Set up HarmonyOS CLI tools
+        uses: ErBWs/setup-ohos@4dbb63025116eb6165ceac58a4bf47cbdc5ac721 # v2
+        with:
+          version: ${{ env.OHOS_COMMAND_LINE_TOOLS_VERSION }}
+          cache: true
+
+      - name: Publish private OHPM package and verify latest
+        id: publish_private_ohpm
+        shell: bash
+        env:
+          CODEARTS_PRIVATE_OHPM: ${{ secrets.CODEARTS_PRIVATE_OHPM }}
+          PACKAGE_VERSION: ${{ needs.build_har.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${CODEARTS_PRIVATE_OHPM:-}" ]]; then
+            echo "CODEARTS_PRIVATE_OHPM is not configured." >&2
+            exit 2
+          fi
+
+          har_path="release/package.har"
+          test -s "$har_path"
+          packaged_version="$(tar -xOzf "$har_path" package/oh-package.json5 | jq -r '.version')"
+          test "$packaged_version" = "$PACKAGE_VERSION"
+
+          private_config="$HOME/.ohpm/.ohpmrc"
+          mkdir -p "$(dirname "$private_config")"
+          umask 077
+          printf '%s' "$CODEARTS_PRIVATE_OHPM" > "$private_config"
+          trap 'rm -f "$private_config"' EXIT
+
+          ohpm --version
+          # OHPM 6.1 rejects an explicit `--tag latest`. Publishing without a
+          # tag updates the registry's standard latest dist-tag.
+          ohpm publish \
+            --publish_registry "$CODEARTS_OHPM_REGISTRY" \
+            "$har_path"
+
+          latest_version=""
+          tags_file="$RUNNER_TEMP/rustdesk-ohpm-dist-tags.txt"
+          for attempt in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            if NO_COLOR=1 ohpm dist-tags list "$PACKAGE_NAME" \
+              --registry "$CODEARTS_OHPM_REGISTRY" > "$tags_file"; then
+              latest_version="$(awk '$1 == "latest:" { print $2; exit }' "$tags_file")"
+              if [[ "$latest_version" == "$PACKAGE_VERSION" ]]; then
+                break
+              fi
+            fi
+
+            if [[ "$attempt" -lt 12 ]]; then
+              echo "latest is not ready yet (attempt $attempt/12); retrying."
+              sleep 5
+            fi
+          done
+
+          if [[ "$latest_version" != "$PACKAGE_VERSION" ]]; then
+            echo "latest resolves to ${latest_version:-<none>} instead of $PACKAGE_VERSION." >&2
+            exit 1
+          fi
+          echo "Verified latest -> $latest_version"
+
+      - name: Dispatch published HAR to ArkTS
+        shell: bash
+        env:
+          DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
+          CORE_REPOSITORY: ${{ needs.resolve_source.outputs.core_repository }}
+          CORE_REF: ${{ needs.resolve_source.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${DOWNSTREAM_DISPATCH_TOKEN:-}" ]]; then
+            echo "DOWNSTREAM_DISPATCH_TOKEN is not configured." >&2
+            exit 2
+          fi
+          if [[ ! "$ARKTS_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "Invalid ArkTS repository: $ARKTS_REPOSITORY" >&2
+            exit 2
+          fi
+
+          jq -n \
+            --arg harRepository "$GITHUB_REPOSITORY" \
+            --arg coreRepository "$CORE_REPOSITORY" \
+            --arg coreRef "$CORE_REF" \
+            --arg packageName "$PACKAGE_NAME" \
+            '{
+              event_type: "rustdesk-har-published",
+              client_payload: {
+                har_repository: $harRepository,
+                core_repository: $coreRepository,
+                core_ref: $coreRef,
+                package_name: $packageName
+              }
+            }' > "$RUNNER_TEMP/rustdesk-har-dispatch.json"
+
+          curl --fail-with-body --silent --show-error \
+            --retry 3 \
+            --retry-all-errors \
+            --request POST \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $DOWNSTREAM_DISPATCH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "$GITHUB_API_URL/repos/$ARKTS_REPOSITORY/dispatches" \
+            --data-binary "@$RUNNER_TEMP/rustdesk-har-dispatch.json"
+
+          echo "Dispatched $PACKAGE_NAME@latest to $ARKTS_REPOSITORY."
