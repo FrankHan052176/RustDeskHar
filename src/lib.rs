@@ -720,7 +720,7 @@ pub fn runtime_start_account_login(payload_json: String) -> String {
 
 #[napi]
 pub fn runtime_start_account_oidc(provider: String) -> String {
-    let provider = provider.trim().to_ascii_lowercase();
+    let provider = provider.trim().to_string();
     if provider.is_empty() {
         return job_start_error(
             "runtime_start_account_oidc",
@@ -2057,6 +2057,11 @@ pub fn session_input_key(session_id: String, key_json: String) -> String {
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
+        if flutter::sessions::get_session_by_session_id(&core_session_id).is_none() {
+            let message = "RustDesk core session not found".to_string();
+            session.last_error = Some(message.clone());
+            return (false, message);
+        }
         let key = match parse_json_payload(&key_json, "sessionInputKey payload") {
             Ok(value) => value,
             Err(message) => return (false, message),
@@ -3247,18 +3252,18 @@ fn account_login_options() -> Value {
                 if let Ok(common_options) = serde_json::from_str::<Value>(raw_common) {
                     if let Some(common_options) = common_options.as_array() {
                         for common_option in common_options {
-                            let name = json_field_string(common_option, "name")
-                                .trim()
-                                .to_ascii_lowercase();
-                            if !name.is_empty() && seen.insert(name.clone()) {
+                            let name = json_field_string(common_option, "name").trim().to_string();
+                            let identity = name.to_ascii_lowercase();
+                            if !name.is_empty() && seen.insert(identity) {
                                 names.push(name);
                             }
                         }
                     }
                 }
             } else if let Some(provider) = option.strip_prefix("oidc/") {
-                let name = provider.trim().to_ascii_lowercase();
-                if !name.is_empty() && seen.insert(name.clone()) {
+                let name = provider.trim().to_string();
+                let identity = name.to_ascii_lowercase();
+                if !name.is_empty() && seen.insert(identity) {
                     names.push(name);
                 }
             }
@@ -3267,7 +3272,7 @@ fn account_login_options() -> Value {
     let providers = names
         .into_iter()
         .map(|name| {
-            let label = match name.as_str() {
+            let label = match name.to_ascii_lowercase().as_str() {
                 "github" => "GitHub".to_string(),
                 "google" => "Google".to_string(),
                 "microsoft" | "azure" => "Microsoft".to_string(),
