@@ -7,7 +7,9 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, c_void, CStr, CString},
-    fs, slice,
+    fs,
+    net::IpAddr,
+    slice,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -295,6 +297,7 @@ struct BridgeSession {
     last_error: Option<String>,
     password_present: bool,
     shared_password: bool,
+    password_ephemeral: bool,
     remember_requested: bool,
     two_factor_pending: bool,
     selected_displays: Vec<i32>,
@@ -625,7 +628,7 @@ pub fn runtime_init(app_dir: String, device_name: String) -> String {
       "buildMarker": BUILD_MARKER,
       "appDir": app_dir,
       "deviceName": normalized_device_name,
-      "apiServer": flutter_ffi::main_get_api_server(),
+      "apiServer": configured_api_server(),
       "upstream": upstream_status_value()
     })
     .to_string()
@@ -671,7 +674,7 @@ pub fn runtime_list_local_dir(path: String) -> String {
 
 #[napi]
 pub fn runtime_get_api_server() -> String {
-    flutter_ffi::main_get_api_server()
+    configured_api_server()
 }
 
 #[napi]
@@ -727,6 +730,12 @@ pub fn runtime_start_account_oidc(provider: String) -> String {
             "Account provider is required".to_string(),
         );
     }
+    if configured_api_server().is_empty() {
+        return job_start_error(
+            "runtime_start_account_oidc",
+            "Account API is not configured".to_string(),
+        );
+    }
     cancel_background_job(account_job_store());
     cancel_background_job(address_book_job_store());
     if let Ok(mut challenge) = account_challenge_store().lock() {
@@ -744,6 +753,15 @@ pub fn runtime_start_account_oidc(provider: String) -> String {
 
 #[napi]
 pub fn runtime_poll_account_oidc() -> String {
+    if configured_api_server().is_empty() {
+        flutter_ffi::main_account_auth_cancel();
+        return background_job_failure(
+            "runtime_poll_account_oidc",
+            "server",
+            "Account API is not configured".to_string(),
+        )
+        .to_string();
+    }
     let raw = flutter_ffi::main_account_auth_result();
     let result = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
     let failed_message = json_field_string(&result, "failed_msg");
@@ -924,7 +942,7 @@ pub fn runtime_set_server_config(config_json: String) -> String {
         .to_string();
     }
 
-    let old_api_server = flutter_ffi::main_get_api_server();
+    let old_api_server = configured_api_server();
     flutter_ffi::main_set_option(
         "custom-rendezvous-server".to_string(),
         json_field_string(&config, "idServer"),
@@ -938,7 +956,7 @@ pub fn runtime_set_server_config(config_json: String) -> String {
         json_field_string(&config, "apiServer"),
     );
     flutter_ffi::main_set_option("key".to_string(), json_field_string(&config, "key"));
-    let new_api_server = flutter_ffi::main_get_api_server();
+    let new_api_server = configured_api_server();
     let account_reset_required = old_api_server != new_api_server;
     if account_reset_required {
         cancel_background_job(account_job_store());
@@ -1590,6 +1608,18 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
     let core_session_id = make_core_session_id(&resolved_session_id);
     let force_relay = json_bool(&options, &["forceRelay", "force_relay"]);
     let normalized = normalize_target(&peer_target, force_relay);
+    if !librustdesk::common::is_direct_ip_access(&normalized.normalized_peer_id)
+        && normalized.custom_server.is_none()
+        && configured_id_server().is_empty()
+    {
+        return action_response(
+            "session_add",
+            false,
+            "Configure an ID server before connecting, or use an explicit id@server target"
+                .to_string(),
+            None,
+        );
+    }
     let conn_type = connection_type_from_options(&options).to_string();
     let view_only = conn_type == "default_conn"
         && json_bool(&options, &["isViewOnly", "is_view_only", "viewOnly", "view_only"]);
@@ -1608,13 +1638,14 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
     let switch_uuid = json_string(&options, &["switchUuid", "switch_uuid"]);
     let conn_token = json_string(&options, &["connToken", "conn_token"]);
     let shared_password = json_bool(&options, &["isSharedPassword", "is_shared_password"]);
+    let password_ephemeral = json_bool(&options, &["passwordEphemeral", "password_ephemeral"]);
     let is_file_transfer = conn_type == "file_transfer";
     let is_view_camera = conn_type == "view_camera";
     let is_terminal = conn_type == "terminal";
     let is_rdp = conn_type == "rdp";
     let is_port_forward = conn_type == "port_forward" || is_rdp;
 
-    if let Err(err) = flutter::session_add(
+    let core_session = match flutter::session_add(
         &core_session_id,
         &normalized.peer_target,
         is_file_transfer,
@@ -1628,12 +1659,22 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
         shared_password,
         conn_token.clone(),
     ) {
-        return action_response(
-            "session_add",
-            false,
-            format!("RustDesk session_add failed: {}", err),
-            None,
-        );
+        Ok(session) => session,
+        Err(err) => {
+            return action_response(
+                "session_add",
+                false,
+                format!("RustDesk session_add failed: {}", err),
+                None,
+            );
+        }
+    };
+    if password_ephemeral {
+        core_session
+            .lc
+            .write()
+            .unwrap()
+            .set_password_ephemeral(true);
     }
 
     // `view-only` is a normal desktop session option rather than a separate
@@ -1670,6 +1711,7 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
         last_error: None,
         password_present: !password.is_empty(),
         shared_password,
+        password_ephemeral,
         remember_requested: false,
         two_factor_pending: false,
         selected_displays: Vec::new(),
@@ -1775,7 +1817,7 @@ pub fn session_login(session_id: String, login_json: String) -> String {
         let password = json_string(&login, &["password"]).unwrap_or_default();
         let os_username = json_string(&login, &["osUsername", "os_username"]).unwrap_or_default();
         let os_password = json_string(&login, &["osPassword", "os_password"]).unwrap_or_default();
-        let remember = json_bool(&login, &["remember"]);
+        let remember = json_bool(&login, &["remember"]) && !session.password_ephemeral;
         session.password_present = !password.is_empty();
         session.remember_requested = remember;
         session.two_factor_pending = true;
@@ -2956,6 +2998,7 @@ fn session_value(session: &BridgeSession) -> Value {
       "lastError": session.last_error,
       "passwordPresent": session.password_present,
       "sharedPassword": session.shared_password,
+      "passwordEphemeral": session.password_ephemeral,
       "rememberRequested": session.remember_requested,
       "twoFactorPending": session.two_factor_pending,
       "selectedDisplays": session.selected_displays,
@@ -3210,7 +3253,7 @@ fn account_user_summary(user: &Value) -> Value {
 }
 
 fn account_login_options() -> Value {
-    let api_server = flutter_ffi::main_get_api_server();
+    let api_server = configured_api_server();
     if api_server.trim().is_empty() {
         return json!({
           "ok": false,
@@ -3297,14 +3340,14 @@ fn account_login_options() -> Value {
 }
 
 fn account_state_snapshot() -> Value {
-    let api_server = flutter_ffi::main_get_api_server();
+    let api_server = configured_api_server();
     let access_token = flutter_ffi::main_get_local_option("access_token".to_string()).0;
     let user_info = flutter_ffi::main_get_local_option("user_info".to_string()).0;
     let user = serde_json::from_str::<Value>(&user_info).unwrap_or_else(|_| json!({}));
     json!({
       "ok": true,
       "action": "runtime_get_account_state",
-      "loggedIn": !access_token.is_empty(),
+      "loggedIn": !api_server.is_empty() && !access_token.is_empty(),
       "apiServer": api_server,
       "user": account_user_summary(&user)
     })
@@ -3409,7 +3452,7 @@ fn require_api_success(response: ApiResponse, context: &str) -> Result<Value, St
 
 fn address_book_sync_is_current(api_server: &str, access_token: &str, generation: u64) -> bool {
     background_job_is_current(address_book_job_store(), generation)
-        && flutter_ffi::main_get_api_server() == api_server
+        && configured_api_server() == api_server
         && flutter_ffi::main_get_local_option("access_token".to_string()).0 == access_token
 }
 
@@ -3424,7 +3467,7 @@ fn require_address_book_success(
         if let Ok(job) = address_book_job_store().lock() {
             if job.running
                 && job.generation == generation
-                && flutter_ffi::main_get_api_server() == api_server
+                && configured_api_server() == api_server
                 && flutter_ffi::main_get_local_option("access_token".to_string()).0
                     == access_token
             {
@@ -3478,7 +3521,7 @@ fn handle_account_response(
     generation: u64,
 ) -> Value {
     if !background_job_is_current(account_job_store(), generation)
-        || flutter_ffi::main_get_api_server() != api_server
+        || configured_api_server() != api_server
     {
         return background_job_failure(
             "runtime_poll_account_action",
@@ -3533,7 +3576,7 @@ fn handle_account_response(
                 );
             }
         };
-        if flutter_ffi::main_get_api_server() != api_server {
+        if configured_api_server() != api_server {
             return background_job_failure(
                 "runtime_poll_account_action",
                 "superseded",
@@ -3599,7 +3642,7 @@ fn handle_account_response(
                 );
             }
         };
-        if flutter_ffi::main_get_api_server() != api_server {
+        if configured_api_server() != api_server {
             return background_job_failure(
                 "runtime_poll_account_action",
                 "superseded",
@@ -3639,7 +3682,7 @@ fn handle_account_response(
 }
 
 fn start_account_login_job(username: String, password: String) -> String {
-    let api_server = flutter_ffi::main_get_api_server();
+    let api_server = configured_api_server();
     if api_server.trim().is_empty() {
         return job_start_error(
             "runtime_start_account_login",
@@ -3715,7 +3758,7 @@ fn start_account_verification_job(challenge_id: String, code: String) -> String 
 }
 
 fn account_logout() -> String {
-    let api_server = flutter_ffi::main_get_api_server();
+    let api_server = configured_api_server();
     let access_token = flutter_ffi::main_get_local_option("access_token".to_string()).0;
     let body = json!({
       "id": flutter_ffi::main_get_my_id(),
@@ -4164,7 +4207,7 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
             );
         }
     };
-    if flutter_ffi::main_get_api_server() != api_server
+    if configured_api_server() != api_server
         || flutter_ffi::main_get_local_option("access_token".to_string()).0 != access_token
     {
         return background_job_failure(
@@ -4199,7 +4242,7 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
 }
 
 fn start_address_book_sync_job() -> String {
-    let api_server = flutter_ffi::main_get_api_server();
+    let api_server = configured_api_server();
     let access_token = flutter_ffi::main_get_local_option("access_token".to_string()).0;
     if api_server.trim().is_empty() || access_token.is_empty() {
         return job_start_error(
@@ -4218,6 +4261,22 @@ fn normalize_server_endpoint(value: String) -> String {
     value.trim().trim_end_matches('/').to_string()
 }
 
+fn configured_id_server() -> String {
+    flutter_ffi::main_get_option("custom-rendezvous-server".to_string())
+        .trim()
+        .to_string()
+}
+
+fn configured_api_server() -> String {
+    let id_server = configured_id_server();
+    let api_server = flutter_ffi::main_get_option("api-server".to_string());
+    if id_server.is_empty() && api_server.trim().is_empty() {
+        String::new()
+    } else {
+        flutter_ffi::main_get_api_server()
+    }
+}
+
 fn server_config_snapshot() -> Value {
     let options = serde_json::from_str::<Value>(&flutter_ffi::main_get_options())
         .unwrap_or_else(|_| json!({}));
@@ -4225,26 +4284,19 @@ fn server_config_snapshot() -> Value {
     let relay_server = json_field_string(&options, "relay-server");
     let api_server = json_field_string(&options, "api-server");
     let key = json_field_string(&options, "key");
-    let account_available = !flutter_ffi::main_get_local_option("access_token".to_string())
-        .0
-        .is_empty();
-    let mode = if id_server.is_empty()
-        && relay_server.is_empty()
-        && api_server.is_empty()
-        && key.is_empty()
-    {
-        "official"
-    } else {
-        "custom"
-    };
+    let effective_api_server = configured_api_server();
+    let account_available = !effective_api_server.is_empty()
+        && !flutter_ffi::main_get_local_option("access_token".to_string())
+            .0
+            .is_empty();
     json!({
-      "mode": mode,
+      "mode": "custom",
       "idServer": id_server,
       "relayServer": relay_server,
       "apiServer": api_server,
       "key": key,
-      "effectiveApiServer": flutter_ffi::main_get_api_server(),
-      "usingPublicServer": flutter_ffi::main_is_using_public_server(),
+      "effectiveApiServer": effective_api_server,
+      "usingPublicServer": false,
       "accountAvailable": account_available
     })
 }
@@ -4261,49 +4313,36 @@ fn parse_server_config(raw: &str) -> Result<Value, String> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if !requested_mode.is_empty() && requested_mode != "official" && requested_mode != "custom" {
+    if requested_mode == "official" {
+        return Err(
+            "Official server mode is not available; configure the server explicitly".to_string(),
+        );
+    }
+    if !requested_mode.is_empty() && requested_mode != "custom" {
         return Err(format!("Unsupported server mode {}", requested_mode));
     }
-    let official = requested_mode == "official";
-    let mut id_server = normalize_server_endpoint(
+    let id_server = normalize_server_endpoint(
         json_raw_string(
             &payload,
             &["idServer", "customRendezvousServer", "host"],
         )
         .unwrap_or_default(),
     );
-    let mut relay_server = normalize_server_endpoint(
+    let relay_server = normalize_server_endpoint(
         json_raw_string(&payload, &["relayServer", "relay"]).unwrap_or_default(),
     );
-    let mut api_server = normalize_server_endpoint(
+    let api_server = normalize_server_endpoint(
         json_raw_string(&payload, &["apiServer", "api"]).unwrap_or_default(),
     );
-    let mut key = json_raw_string(&payload, &["key"])
+    let key = json_raw_string(&payload, &["key"])
         .unwrap_or_default()
         .trim()
         .to_string();
-    if official {
-        id_server.clear();
-        relay_server.clear();
-        api_server.clear();
-        key.clear();
-    }
-    let mode = if official
-        || (requested_mode.is_empty()
-            && id_server.is_empty()
-            && relay_server.is_empty()
-            && api_server.is_empty()
-            && key.is_empty())
-    {
-        "official"
-    } else {
-        "custom"
-    };
     let test_with_proxy = json_lookup(&payload, &["testWithProxy", "test_with_proxy"])
         .map(|_| json_bool(&payload, &["testWithProxy", "test_with_proxy"]))
         .unwrap_or(true);
     Ok(json!({
-      "mode": mode,
+      "mode": "custom",
       "idServer": id_server,
       "relayServer": relay_server,
       "apiServer": api_server,
@@ -4313,13 +4352,6 @@ fn parse_server_config(raw: &str) -> Result<Value, String> {
 }
 
 fn test_server_config(config: &Value) -> Value {
-    if json_field_string(config, "mode") == "official" {
-        return json!({
-          "idServer": "",
-          "relayServer": "",
-          "apiServer": ""
-        });
-    }
     let id_server = json_field_string(config, "idServer");
     let relay_server = json_field_string(config, "relayServer");
     let api_server = json_field_string(config, "apiServer");
@@ -4388,8 +4420,27 @@ fn lan_peer_summary(peer: &Value) -> Value {
       "hostname": json_field_string(peer, "hostname"),
       "platform": json_field_string(peer, "platform"),
       "online": peer.get("online").and_then(Value::as_bool).unwrap_or(false),
+      "ip": lan_peer_ip(peer),
       "ipMac": json_object_field(peer, "ip_mac")
     })
+}
+
+fn lan_peer_ip(peer: &Value) -> String {
+    let mut addresses = peer
+        .get("ip_mac")
+        .and_then(Value::as_object)
+        .map(|entries| {
+            entries
+                .keys()
+                .filter_map(|value| IpAddr::from_str(value).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    addresses.sort_unstable_by_key(|address| (!address.is_ipv4(), *address));
+    addresses
+        .first()
+        .map(ToString::to_string)
+        .unwrap_or_default()
 }
 
 fn address_book_peer_summary(peer: &Value) -> Value {
