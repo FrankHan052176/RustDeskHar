@@ -2477,6 +2477,12 @@ pub fn session_get_image_quality(session_id: String) -> Option<String> {
 }
 
 #[napi]
+pub fn session_get_conn_token(session_id: String) -> Option<String> {
+    core_session_id_for(&session_id)
+        .and_then(|core_session_id| flutter_ffi::session_get_conn_token(core_session_id).0)
+}
+
+#[napi]
 pub fn session_set_custom_image_quality(session_id: String, value: i32) {
     let _ = update_session(&session_id, "session_set_custom_image_quality", |session| {
         if session.phase == "closed" {
