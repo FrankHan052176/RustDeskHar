@@ -425,13 +425,16 @@ fn update_bridge_session_from_event(session_id: flutter_ffi::SessionID, event: &
         "connection_ready" => {
             session.phase = "transport_ready".to_string();
             session.last_error = None;
+            session.two_factor_pending = false;
         }
         "peer_info" | "sync_peer_info" => {
             session.phase = "connected".to_string();
             session.last_error = None;
+            session.two_factor_pending = false;
         }
         "close" => {
             session.phase = "closed".to_string();
+            session.two_factor_pending = false;
         }
         "msgbox" => {
             let message_type = event
@@ -446,18 +449,22 @@ fn update_bridge_session_from_event(session_id: flutter_ffi::SessionID, event: &
                 .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if matches!(
+            if message_type == "input-2fa" {
+                session.phase = "awaiting_authentication".to_string();
+                session.two_factor_pending = true;
+            } else if matches!(
                 message_type,
                 "input-password"
                     | "re-input-password"
-                    | "input-2fa"
                     | "session-login"
                     | "session-re-login"
                     | "session-login-password"
             ) {
                 session.phase = "awaiting_authentication".to_string();
+                session.two_factor_pending = false;
             } else if title == "Connection Error" || message_type.contains("error") {
                 session.phase = "failed".to_string();
+                session.two_factor_pending = false;
                 session.last_error = Some(if title.is_empty() {
                     text.to_string()
                 } else {
@@ -1820,7 +1827,9 @@ pub fn session_login(session_id: String, login_json: String) -> String {
         let remember = json_bool(&login, &["remember"]) && !session.password_ephemeral;
         session.password_present = !password.is_empty();
         session.remember_requested = remember;
-        session.two_factor_pending = true;
+        // Password authentication is the first factor. The peer explicitly
+        // requests Auth2FA later with an `input-2fa` event.
+        session.two_factor_pending = false;
 
         if let Some(blocker) = core_binding_blocker() {
             session.phase = "blocked_login_handshake".to_string();
@@ -1850,8 +1859,6 @@ pub fn session_login(session_id: String, login_json: String) -> String {
 #[napi]
 pub fn session_send2fa(session_id: String, code: String, trust_this_device: bool) -> String {
     update_session(&session_id, "session_send2fa", |session| {
-        session.two_factor_pending = false;
-
         if let Some(blocker) = core_binding_blocker() {
             session.phase = "blocked_two_factor".to_string();
             session.last_error = Some(blocker.clone());
@@ -1867,7 +1874,31 @@ pub fn session_send2fa(session_id: String, code: String, trust_this_device: bool
             return (false, "Missing core session id".to_string());
         };
 
+        if !session.two_factor_pending {
+            session.phase = "awaiting_primary_authentication".to_string();
+            session.last_error =
+                Some("The peer has not requested 2FA; submit the password first".to_string());
+            log::warn!(
+                "Blocked premature 2FA submission: bridge_session={} core_session={} phase={}",
+                session.session_id,
+                core_session_id,
+                session.phase
+            );
+            return (
+                false,
+                "The peer has not requested 2FA; submit the password first".to_string(),
+            );
+        }
+
+        log::info!(
+            "Forwarding Auth2FA: bridge_session={} core_session={} code_len={} trust_this_device={}",
+            session.session_id,
+            core_session_id,
+            code.len(),
+            trust_this_device
+        );
         flutter_ffi::session_send2fa(core_session_id, code.clone(), trust_this_device);
+        session.two_factor_pending = false;
         session.phase = "two_factor_submitted".to_string();
         session.last_error = None;
         (
@@ -2480,6 +2511,13 @@ pub fn session_get_image_quality(session_id: String) -> Option<String> {
 pub fn session_get_conn_token(session_id: String) -> Option<String> {
     core_session_id_for(&session_id)
         .and_then(|core_session_id| flutter_ffi::session_get_conn_token(core_session_id).0)
+}
+
+#[napi]
+pub fn session_get_enable_trusted_devices(session_id: String) -> bool {
+    core_session_id_for(&session_id)
+        .map(|core_session_id| flutter_ffi::session_get_enable_trusted_devices(core_session_id).0)
+        .unwrap_or(false)
 }
 
 #[napi]
