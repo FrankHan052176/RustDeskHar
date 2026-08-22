@@ -226,7 +226,6 @@ jobs:
           DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
           CORE_REPOSITORY: ${{ needs.source.outputs.repository }}
           CORE_REF: ${{ needs.source.outputs.ref }}
-          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           : "${DOWNSTREAM_DISPATCH_TOKEN:?DOWNSTREAM_DISPATCH_TOKEN is required}"
@@ -235,13 +234,11 @@ jobs:
             --arg coreRepository "$CORE_REPOSITORY" \
             --arg coreRef "$CORE_REF" \
             --arg packageName "$PACKAGE_NAME" \
-            --arg packageVersion "$PACKAGE_VERSION" \
             '{event_type: "rustdesk-har-published", client_payload: {
               har_repository: $harRepository,
               core_repository: $coreRepository,
               core_ref: $coreRef,
-              package_name: $packageName,
-              package_version: $packageVersion
+              package_name: $packageName
             }}' > "$RUNNER_TEMP/dispatch.json"
           curl --fail-with-body --silent --show-error \
             --request POST \
