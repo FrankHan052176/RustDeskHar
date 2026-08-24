@@ -137,7 +137,10 @@ jobs:
           else
             core_commit_count="$(git -C R_RustDesk-Core rev-list --count HEAD)"
           fi
-          version="${core_version}-${core_commit_count}-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}-g${CORE_SHA:0:8}"
+          printf -v core_commit_serial '%06d' "$core_commit_count"
+          printf -v run_serial '%09d' "$GITHUB_RUN_NUMBER"
+          printf -v attempt_serial '%02d' "$GITHUB_RUN_ATTEMPT"
+          version="${core_version}-r${core_commit_serial}-${run_serial}-${attempt_serial}-g${CORE_SHA:0:8}"
           jq --arg version "$version" '.version = $version' \
             R_RustDesk-Har/package/oh-package.json5 > "$RUNNER_TEMP/oh-package.json5"
           mv "$RUNNER_TEMP/oh-package.json5" R_RustDesk-Har/package/oh-package.json5
@@ -226,6 +229,8 @@ jobs:
           DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
           CORE_REPOSITORY: ${{ needs.source.outputs.repository }}
           CORE_REF: ${{ needs.source.outputs.ref }}
+          CORE_SHA: ${{ needs.source.outputs.sha }}
+          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           : "${DOWNSTREAM_DISPATCH_TOKEN:?DOWNSTREAM_DISPATCH_TOKEN is required}"
@@ -233,12 +238,18 @@ jobs:
             --arg harRepository "$GITHUB_REPOSITORY" \
             --arg coreRepository "$CORE_REPOSITORY" \
             --arg coreRef "$CORE_REF" \
+            --arg coreSha "$CORE_SHA" \
             --arg packageName "$PACKAGE_NAME" \
+            --arg packageVersion "$PACKAGE_VERSION" \
+            --arg harSha "$GITHUB_SHA" \
             '{event_type: "rustdesk-har-published", client_payload: {
               har_repository: $harRepository,
+              har_sha: $harSha,
               core_repository: $coreRepository,
               core_ref: $coreRef,
-              package_name: $packageName
+              core_sha: $coreSha,
+              package_name: $packageName,
+              package_version: $packageVersion
             }}' > "$RUNNER_TEMP/dispatch.json"
           curl --fail-with-body --silent --show-error \
             --request POST \
