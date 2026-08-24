@@ -265,6 +265,10 @@ export declare function runtimeListLocalDir(path: string): string
 
 export declare function runtimeListRecentPeers(): string
 
+export declare function runtimeQueryPeerOnlineStates(peerIdsJson: string): Promise<string>
+
+export declare function runtimeProbePeerDirectStates(targetsJson: string): Promise<string>
+
 export declare function runtimeRemoveRecentPeer(peerId: string): string
 
 export declare function runtimeScanLanPeers(): string
@@ -273,7 +277,7 @@ export declare function runtimeSetFavorite(peerId: string, favorite: boolean): s
 
 export declare function runtimeSetServerConfig(configJson: string): string
 
-export declare function runtimeTestServerConfig(configJson: string): string
+export declare function runtimeTestServerConfig(configJson: string): Promise<string>
 
 export declare function sessionAdd(sessionId: string, peerTarget: string, optionsJson: string): string
 

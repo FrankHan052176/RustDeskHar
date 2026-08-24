@@ -528,6 +528,14 @@ export function runtimeListRecentPeers(): string {
   return native.runtimeListRecentPeers();
 }
 
+export function runtimeQueryPeerOnlineStates(peerIdsJson: string): Promise<string> {
+  return native.runtimeQueryPeerOnlineStates(peerIdsJson);
+}
+
+export function runtimeProbePeerDirectStates(targetsJson: string): Promise<string> {
+  return native.runtimeProbePeerDirectStates(targetsJson);
+}
+
 export function runtimeRemoveRecentPeer(peerId: string): string {
   return native.runtimeRemoveRecentPeer(peerId);
 }
@@ -544,7 +552,7 @@ export function runtimeSetServerConfig(configJson: string): string {
   return native.runtimeSetServerConfig(configJson);
 }
 
-export function runtimeTestServerConfig(configJson: string): string {
+export function runtimeTestServerConfig(configJson: string): Promise<string> {
   return native.runtimeTestServerConfig(configJson);
 }
 

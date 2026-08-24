@@ -1,3 +1,9 @@
+use hbb_common::{
+    message_proto::{message as peer_message, Message as PeerMessage},
+    protobuf::Message as _,
+    rendezvous_proto::{rendezvous_message, RendezvousMessage, RequestRelay, TestNatRequest},
+    Stream,
+};
 use librustdesk::{
     flutter, flutter_ffi,
     platform::ohos::{self, DirectRenderTarget},
@@ -8,14 +14,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, c_void, CStr, CString},
     fs,
-    net::IpAddr,
+    net::{IpAddr, SocketAddr, TcpStream},
     slice,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[repr(C)]
@@ -412,7 +418,10 @@ fn record_core_event(session_id: flutter_ffi::SessionID, event: flutter_ffi::Eve
 
 #[cfg(target_env = "ohos")]
 fn update_bridge_session_from_event(session_id: flutter_ffi::SessionID, event: &Value) {
-    let name = event.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = event
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     let core_session_id = session_id.to_string();
     let mut sessions = session_store().lock().unwrap();
     let Some(session) = sessions
@@ -773,12 +782,8 @@ pub fn runtime_poll_account_oidc() -> String {
     let result = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({}));
     let failed_message = json_field_string(&result, "failed_msg");
     if !failed_message.is_empty() {
-        return background_job_failure(
-            "runtime_poll_account_oidc",
-            "provider",
-            failed_message,
-        )
-        .to_string();
+        return background_job_failure("runtime_poll_account_oidc", "provider", failed_message)
+            .to_string();
     }
     if let Some(auth_body) = result.get("auth_body").filter(|body| body.is_object()) {
         let response_type = json_field_string(auth_body, "type");
@@ -881,10 +886,7 @@ pub fn runtime_start_address_book_sync() -> String {
 
 #[napi]
 pub fn runtime_poll_address_book_sync() -> String {
-    poll_background_job(
-        address_book_job_store(),
-        "runtime_poll_address_book_sync",
-    )
+    poll_background_job(address_book_job_store(), "runtime_poll_address_book_sync")
 }
 
 #[napi]
@@ -898,8 +900,8 @@ pub fn runtime_get_server_config() -> String {
 }
 
 #[napi]
-pub fn runtime_test_server_config(config_json: String) -> String {
-    let config = match parse_server_config(&config_json) {
+pub async fn runtime_test_server_config(config_json: String) -> String {
+    let mut config = match parse_server_config(&config_json) {
         Ok(config) => config,
         Err(message) => {
             return json!({
@@ -911,12 +913,41 @@ pub fn runtime_test_server_config(config_json: String) -> String {
             .to_string();
         }
     };
-    let errors = test_server_config(&config);
+    let errors = test_server_config(&config).await;
     let ok = server_config_errors_empty(&errors);
+    let has_server = server_config_has_endpoint(&config);
+    if let Some(fields) = config.as_object_mut() {
+        fields.insert("remoteReachable".to_string(), (ok && has_server).into());
+        fields.insert(
+            "effectiveApiServer".to_string(),
+            configured_api_server().into(),
+        );
+        fields.insert(
+            "resultState".to_string(),
+            (if ok {
+                if has_server {
+                    "test-success"
+                } else {
+                    "empty-success"
+                }
+            } else {
+                "error"
+            })
+            .into(),
+        );
+    }
     json!({
       "ok": ok,
       "action": "runtime_test_server_config",
-      "message": if ok { "Server configuration is valid" } else { "Invalid server configuration" },
+      "message": if ok {
+          if has_server {
+              "已填写的服务器均返回了有效的 RustDesk 服务响应"
+          } else {
+              "未配置服务器；将使用局域网直连或手动直连"
+          }
+      } else {
+          "服务器未通过 RustDesk 服务协议校验"
+      },
       "config": config,
       "errors": errors
     })
@@ -937,12 +968,12 @@ pub fn runtime_set_server_config(config_json: String) -> String {
             .to_string();
         }
     };
-    let errors = test_server_config(&config);
+    let errors = validate_server_config_format(&config);
     if !server_config_errors_empty(&errors) {
         return json!({
           "ok": false,
           "action": "runtime_set_server_config",
-          "message": "Invalid server configuration",
+          "message": "服务器配置格式有误",
           "config": config,
           "errors": errors
         })
@@ -973,11 +1004,20 @@ pub fn runtime_set_server_config(config_json: String) -> String {
         clear_account_state();
     }
 
+    let mut saved_config = server_config_snapshot();
+    if let Some(fields) = saved_config.as_object_mut() {
+        fields.insert("remoteReachable".to_string(), false.into());
+        fields.insert("resultState".to_string(), "save-success".into());
+    }
     json!({
       "ok": true,
       "action": "runtime_set_server_config",
-      "message": "Server configuration saved",
-      "config": server_config_snapshot(),
+      "message": if server_config_has_endpoint(&config) {
+          "服务器配置已保存；可点击“测试配置”检查连接"
+      } else {
+          "服务器配置已清空；当前不使用自定义服务器"
+      },
+      "config": saved_config,
       "errors": errors,
       "accountResetRequired": account_reset_required
     })
@@ -989,10 +1029,7 @@ pub fn runtime_list_recent_peers() -> String {
     let raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
     match parse_json_list(&raw, "recent peer list") {
         Ok(peers) => {
-            let peers = peers
-                .iter()
-                .map(recent_peer_summary)
-                .collect::<Vec<_>>();
+            let peers = peers.iter().map(recent_peer_summary).collect::<Vec<_>>();
             json!({
               "ok": true,
               "action": "runtime_list_recent_peers",
@@ -1010,6 +1047,197 @@ pub fn runtime_list_recent_peers() -> String {
         })
         .to_string(),
     }
+}
+
+#[napi]
+pub async fn runtime_query_peer_online_states(peer_ids_json: String) -> String {
+    let values = match serde_json::from_str::<Value>(&peer_ids_json) {
+        Ok(Value::Array(values)) => values,
+        Ok(_) => {
+            return json!({
+              "ok": false,
+              "action": "runtime_query_peer_online_states",
+              "message": "Peer id list must be a JSON array",
+              "onlines": [],
+              "offlines": []
+            })
+            .to_string();
+        }
+        Err(error) => {
+            return json!({
+              "ok": false,
+              "action": "runtime_query_peer_online_states",
+              "message": format!("Invalid peer id list: {error}"),
+              "onlines": [],
+              "offlines": []
+            })
+            .to_string();
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut ids = Vec::new();
+    for value in values {
+        let Some(id) = value.as_str().map(str::trim) else {
+            continue;
+        };
+        if !id.is_empty() && seen.insert(id.to_owned()) {
+            ids.push(id.to_owned());
+        }
+    }
+    if ids.is_empty() {
+        return json!({
+          "ok": true,
+          "action": "runtime_query_peer_online_states",
+          "message": "No peers to query",
+          "onlines": [],
+          "offlines": []
+        })
+        .to_string();
+    }
+    match librustdesk::query_online_states_result(ids).await {
+        Ok((onlines, offlines)) => json!({
+          "ok": true,
+          "action": "runtime_query_peer_online_states",
+          "message": "Peer online states updated",
+          "onlines": onlines,
+          "offlines": offlines
+        })
+        .to_string(),
+        Err(error) => json!({
+          "ok": false,
+          "action": "runtime_query_peer_online_states",
+          "message": error.to_string(),
+          "onlines": [],
+          "offlines": []
+        })
+        .to_string(),
+    }
+}
+
+enum DirectPeerProbeOutcome {
+    Online,
+    Offline(String),
+    Unknown(String),
+}
+
+async fn probe_direct_peer_api(target: String) -> DirectPeerProbeOutcome {
+    let normalized = match validate_socket_target(&target, hbb_common::config::WS_RENDEZVOUS_PORT) {
+        Ok(target) => target,
+        Err(message) => return DirectPeerProbeOutcome::Unknown(message),
+    };
+    let mut stream = match connect_test_stream(normalized, false).await {
+        Ok(stream) => stream,
+        Err(message) => return DirectPeerProbeOutcome::Offline(message),
+    };
+    let Some(frame) = stream.next_timeout(1_500).await else {
+        return DirectPeerProbeOutcome::Unknown(
+            "端口可连接，但未收到 RustDesk 直连握手".to_string(),
+        );
+    };
+    let bytes = match frame {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return DirectPeerProbeOutcome::Unknown(format!("读取 RustDesk 直连握手失败: {error}"))
+        }
+    };
+    let message = match PeerMessage::parse_from_bytes(&bytes) {
+        Ok(message) => message,
+        Err(_) => {
+            return DirectPeerProbeOutcome::Unknown("端口响应不是 RustDesk 直连协议".to_string())
+        }
+    };
+    if matches!(
+        message.union,
+        Some(peer_message::Union::Hash(_)) | Some(peer_message::Union::SignedId(_))
+    ) {
+        DirectPeerProbeOutcome::Online
+    } else {
+        DirectPeerProbeOutcome::Unknown("端口未返回 RustDesk 直连认证握手".to_string())
+    }
+}
+
+#[napi]
+pub async fn runtime_probe_peer_direct_states(targets_json: String) -> String {
+    let values = match serde_json::from_str::<Value>(&targets_json) {
+        Ok(Value::Array(values)) => values,
+        Ok(_) => {
+            return json!({
+              "ok": false,
+              "action": "runtime_probe_peer_direct_states",
+              "message": "Direct peer target list must be a JSON array",
+              "onlines": [],
+              "offlines": [],
+              "unknowns": []
+            })
+            .to_string();
+        }
+        Err(error) => {
+            return json!({
+              "ok": false,
+              "action": "runtime_probe_peer_direct_states",
+              "message": format!("Invalid direct peer target list: {error}"),
+              "onlines": [],
+              "offlines": [],
+              "unknowns": []
+            })
+            .to_string();
+        }
+    };
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+    for value in values.into_iter().take(64) {
+        let key = json_field_string(&value, "key");
+        let target = json_field_string(&value, "target");
+        if !key.is_empty() && !target.is_empty() && seen.insert(key.clone()) {
+            targets.push((key, target));
+        }
+    }
+    if targets.is_empty() {
+        return json!({
+          "ok": true,
+          "action": "runtime_probe_peer_direct_states",
+          "message": "No direct peers to probe",
+          "onlines": [],
+          "offlines": [],
+          "unknowns": []
+        })
+        .to_string();
+    }
+
+    let mut tasks = hbb_common::tokio::task::JoinSet::new();
+    for (key, target) in targets {
+        tasks.spawn(async move { (key, probe_direct_peer_api(target).await) });
+    }
+    let mut onlines = Vec::new();
+    let mut offlines = Vec::new();
+    let mut unknowns = Vec::new();
+    let mut details = serde_json::Map::new();
+    while let Some(result) = tasks.join_next().await {
+        let Ok((key, outcome)) = result else {
+            continue;
+        };
+        match outcome {
+            DirectPeerProbeOutcome::Online => onlines.push(key),
+            DirectPeerProbeOutcome::Offline(message) => {
+                details.insert(key.clone(), Value::String(message));
+                offlines.push(key);
+            }
+            DirectPeerProbeOutcome::Unknown(message) => {
+                details.insert(key.clone(), Value::String(message));
+                unknowns.push(key);
+            }
+        }
+    }
+    json!({
+      "ok": true,
+      "action": "runtime_probe_peer_direct_states",
+      "message": "Direct peer states updated",
+      "onlines": onlines,
+      "offlines": offlines,
+      "unknowns": unknowns,
+      "details": details
+    })
+    .to_string()
 }
 
 #[napi]
@@ -1082,7 +1310,21 @@ pub fn runtime_set_favorite(peer_id: String, favorite: bool) -> String {
 
 #[napi]
 pub fn runtime_scan_lan_peers() -> String {
+    // A LAN address is volatile transport metadata. Start every explicit scan
+    // from an empty snapshot so an offline device cannot keep presenting an
+    // obsolete IP after DHCP/network changes.
+    let previous_peers = hbb_common::config::LanPeers::load().peers;
+    migrate_legacy_lan_passwords(&previous_peers);
+    hbb_common::config::LanPeers::store(&[]);
+    lan_preferred_ip_store().lock().unwrap().clear();
+    let generation = LAN_SCAN_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
+    let recent_raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
+    let recent = parse_json_list(&recent_raw, "recent LAN candidates").unwrap_or_default();
     flutter_ffi::main_discover();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(3_100));
+        resolve_lan_preferred_ips(generation, &recent);
+    });
     json!({
       "ok": true,
       "action": "runtime_scan_lan_peers",
@@ -1093,13 +1335,129 @@ pub fn runtime_scan_lan_peers() -> String {
     .to_string()
 }
 
+static LAN_SCAN_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn lan_preferred_ip_store() -> &'static Mutex<HashMap<String, String>> {
+    static STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn resolve_lan_preferred_ips(generation: u64, recent: &[Value]) {
+    if LAN_SCAN_GENERATION.load(Ordering::Relaxed) != generation {
+        return;
+    }
+    let peers = hbb_common::config::LanPeers::load().peers;
+    let mut resolved = HashMap::new();
+    for peer in peers {
+        let mut discovered = peer.ip_mac.keys().cloned().collect::<Vec<_>>();
+        discovered.sort_by(|left, right| right.cmp(left));
+        discovered.dedup();
+        let recent_candidate = recent_lan_candidate(&peer, recent);
+        if let Some(candidate) = &recent_candidate {
+            migrate_peer_password(&peer.id, candidate);
+        }
+        let mut candidates = Vec::new();
+        if let Some(candidate) = recent_candidate {
+            candidates.push(candidate);
+        }
+        for candidate in &discovered {
+            if !candidates.contains(candidate) {
+                candidates.push(candidate.clone());
+            }
+        }
+        let preferred = candidates
+            .iter()
+            .find(|candidate| lan_direct_port_responds(candidate))
+            .cloned()
+            .or_else(|| discovered.first().cloned());
+        if let Some(preferred) = preferred {
+            resolved.insert(peer.id, preferred);
+        }
+    }
+    if LAN_SCAN_GENERATION.load(Ordering::Relaxed) == generation {
+        *lan_preferred_ip_store().lock().unwrap() = resolved;
+    }
+}
+
+fn recent_lan_candidate(
+    peer: &hbb_common::config::DiscoveryPeer,
+    recent: &[Value],
+) -> Option<String> {
+    recent.iter().find_map(|row| {
+        let candidate = json_field_string(row, "id");
+        IpAddr::from_str(&candidate).ok()?;
+        let recent_username = json_field_string(row, "username");
+        let recent_hostname = json_field_string(row, "hostname");
+        let username_match = !peer.username.is_empty() && peer.username == recent_username;
+        let hostname_match = !peer.hostname.is_empty() && peer.hostname == recent_hostname;
+        let same_identity = username_match || hostname_match;
+        same_identity.then_some(candidate)
+    })
+}
+
+fn lan_direct_port_responds(ip: &str) -> bool {
+    let Ok(ip) = IpAddr::from_str(ip) else {
+        return false;
+    };
+    let target = SocketAddr::new(ip, hbb_common::config::WS_RENDEZVOUS_PORT as u16);
+    TcpStream::connect_timeout(&target, Duration::from_millis(250)).is_ok()
+}
+
+fn migrate_peer_password(peer_id: &str, legacy_target: &str) {
+    if peer_id.is_empty() || legacy_target.is_empty() {
+        return;
+    }
+    let mut stable_config = hbb_common::config::PeerConfig::load(peer_id);
+    if !stable_config.password.is_empty() {
+        return;
+    }
+    let legacy_config = hbb_common::config::PeerConfig::load(legacy_target);
+    if !legacy_config.password.is_empty() {
+        stable_config.password = legacy_config.password;
+        stable_config.store(peer_id);
+    }
+}
+
+fn migrate_legacy_lan_passwords(peers: &[hbb_common::config::DiscoveryPeer]) {
+    for peer in peers {
+        if peer.id.is_empty() {
+            continue;
+        }
+        let mut stable_config = hbb_common::config::PeerConfig::load(&peer.id);
+        if !stable_config.password.is_empty() {
+            continue;
+        }
+        for ip in peer.ip_mac.keys() {
+            let legacy_config = hbb_common::config::PeerConfig::load(ip);
+            if !legacy_config.password.is_empty() {
+                stable_config.password = legacy_config.password;
+                stable_config.store(&peer.id);
+                break;
+            }
+        }
+    }
+}
+
 #[napi]
 pub fn runtime_list_lan_peers() -> String {
-    let raw = serde_json::to_string(&hbb_common::config::LanPeers::load().peers)
-        .unwrap_or_default();
+    let raw =
+        serde_json::to_string(&hbb_common::config::LanPeers::load().peers).unwrap_or_default();
     match parse_json_list(&raw, "LAN peer list") {
         Ok(peers) => {
-            let peers = peers.iter().map(lan_peer_summary).collect::<Vec<_>>();
+            // Core inserts the newest discovery response first. Deduplicate by
+            // stable RustDesk ID so an older persisted row can never win in UI
+            // keyed rendering when username or address metadata changes.
+            let mut seen_ids = HashSet::new();
+            let recent_raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
+            let recent = parse_json_list(&recent_raw, "recent LAN candidates").unwrap_or_default();
+            let peers = peers
+                .iter()
+                .filter(|peer| {
+                    let id = json_field_string(peer, "id");
+                    !id.is_empty() && seen_ids.insert(id)
+                })
+                .map(|peer| lan_peer_summary(peer, &recent))
+                .collect::<Vec<_>>();
             json!({
               "ok": true,
               "action": "runtime_list_lan_peers",
@@ -1629,7 +1987,10 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
     }
     let conn_type = connection_type_from_options(&options).to_string();
     let view_only = conn_type == "default_conn"
-        && json_bool(&options, &["isViewOnly", "is_view_only", "viewOnly", "view_only"]);
+        && json_bool(
+            &options,
+            &["isViewOnly", "is_view_only", "viewOnly", "view_only"],
+        );
 
     let mut sessions = session_store().lock().unwrap();
     if sessions.contains_key(&resolved_session_id) {
@@ -1696,10 +2057,7 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
     )
     .unwrap_or(false);
     if current_view_only != view_only {
-        flutter_ffi::session_toggle_option(
-            core_session_id.clone(),
-            VIEW_ONLY_OPTION.to_string(),
-        );
+        flutter_ffi::session_toggle_option(core_session_id.clone(), VIEW_ONLY_OPTION.to_string());
     }
 
     let session = BridgeSession {
@@ -2008,7 +2366,10 @@ pub fn session_send_pointer(session_id: String, pointer_json: String) -> String 
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Input is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Input is disabled for a view-only session".to_string(),
+            );
         }
         session.last_pointer_payload = Some(pointer_json.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
@@ -2027,7 +2388,10 @@ pub fn session_send_mouse(session_id: String, mouse_json: String) -> String {
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Input is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Input is disabled for a view-only session".to_string(),
+            );
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2111,7 +2475,10 @@ pub fn session_set_codec_preference(session_id: String, codec: String) -> String
             if should_push_update {
                 format!("Updated RustDesk codec preference to {}", normalized)
             } else {
-                format!("Prepared RustDesk codec preference for first login: {}", normalized)
+                format!(
+                    "Prepared RustDesk codec preference for first login: {}",
+                    normalized
+                )
             },
         )
     })
@@ -2124,7 +2491,10 @@ pub fn session_input_key(session_id: String, key_json: String) -> String {
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Input is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Input is disabled for a view-only session".to_string(),
+            );
         }
         session.last_key_payload = Some(key_json.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
@@ -2180,7 +2550,10 @@ pub fn session_handle_flutter_key_event(session_id: String, key_json: String) ->
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Input is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Input is disabled for a view-only session".to_string(),
+            );
         }
         session.last_key_payload = Some(key_json.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
@@ -2227,7 +2600,10 @@ pub fn session_enter_or_leave(session_id: String, enter: bool) -> String {
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Keyboard capture is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Keyboard capture is disabled for a view-only session".to_string(),
+            );
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2258,7 +2634,10 @@ pub fn session_input_string(session_id: String, value: String) -> String {
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Input is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Input is disabled for a view-only session".to_string(),
+            );
         }
         session.last_text_payload = Some(value.clone());
         let Some(core_session_id) = parse_core_session_id(session) else {
@@ -2322,7 +2701,10 @@ pub fn session_send_chat(session_id: String, text: String) -> String {
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Chat is disabled for a view-only session".to_string());
+            return (
+                false,
+                "Chat is disabled for a view-only session".to_string(),
+            );
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2340,7 +2722,10 @@ pub fn session_send_note(session_id: String, note: String) {
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "Notes are disabled for a view-only session".to_string());
+            return (
+                false,
+                "Notes are disabled for a view-only session".to_string(),
+            );
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2663,7 +3048,10 @@ pub fn session_read_remote_dir(session_id: String, path: String, include_hidden:
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "File access is disabled for a view-only session".to_string());
+            return (
+                false,
+                "File access is disabled for a view-only session".to_string(),
+            );
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2690,7 +3078,10 @@ pub fn session_send_files(
             return (false, "Session is closed".to_string());
         }
         if session.view_only {
-            return (false, "File transfer is disabled for a view-only session".to_string());
+            return (
+                false,
+                "File transfer is disabled for a view-only session".to_string(),
+            );
         }
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
@@ -2727,7 +3118,10 @@ pub fn session_set_confirm_override_file(
                 return (false, "Session is closed".to_string());
             }
             if session.view_only {
-                return (false, "File transfer is disabled for a view-only session".to_string());
+                return (
+                    false,
+                    "File transfer is disabled for a view-only session".to_string(),
+                );
             }
             let Some(core_session_id) = parse_core_session_id(session) else {
                 return (false, "Missing core session id".to_string());
@@ -3226,7 +3620,11 @@ where
     std::thread::spawn(move || {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(generation)))
             .unwrap_or_else(|_| {
-                background_job_failure(action, "internal", "Background operation failed".to_string())
+                background_job_failure(
+                    action,
+                    "internal",
+                    "Background operation failed".to_string(),
+                )
             });
         if let Ok(mut job) = store.lock() {
             if job.generation != generation {
@@ -3435,13 +3833,8 @@ fn api_request(
         path.trim_start_matches('/')
     );
     let headers = api_request_headers(access_token, body.is_none());
-    let raw = librustdesk::common::http_request_sync(
-        url,
-        method.to_string(),
-        body,
-        headers,
-    )
-    .map_err(|err| err.to_string())?;
+    let raw = librustdesk::common::http_request_sync(url, method.to_string(), body, headers)
+        .map_err(|err| err.to_string())?;
     let envelope = serde_json::from_str::<Value>(&raw)
         .map_err(|err| format!("Invalid HTTP response envelope: {}", err))?;
     let status_code = envelope
@@ -3459,10 +3852,7 @@ fn api_request(
     } else {
         serde_json::from_str::<Value>(&raw_body).unwrap_or_else(|_| Value::String(raw_body.clone()))
     };
-    Ok(ApiResponse {
-        status_code,
-        body,
-    })
+    Ok(ApiResponse { status_code, body })
 }
 
 fn api_error_message(response: &ApiResponse) -> String {
@@ -3512,8 +3902,7 @@ fn require_address_book_success(
             if job.running
                 && job.generation == generation
                 && configured_api_server() == api_server
-                && flutter_ffi::main_get_local_option("access_token".to_string()).0
-                    == access_token
+                && flutter_ffi::main_get_local_option("access_token".to_string()).0 == access_token
             {
                 clear_account_state();
             }
@@ -3524,8 +3913,7 @@ fn require_address_book_success(
 
 fn login_request_body(username: &str, password: Option<&str>) -> Value {
     let device_info_raw = flutter_ffi::main_get_login_device_info().0;
-    let device_info = serde_json::from_str::<Value>(&device_info_raw)
-        .unwrap_or_else(|_| json!({}));
+    let device_info = serde_json::from_str::<Value>(&device_info_raw).unwrap_or_else(|_| json!({}));
     let mut body = serde_json::Map::new();
     body.insert("username".to_string(), username.into());
     if let Some(password) = password {
@@ -3541,8 +3929,7 @@ fn login_request_body(username: &str, password: Option<&str>) -> Value {
 
 fn verification_request_body(challenge: &AccountChallenge, code: &str) -> Value {
     let device_info_raw = flutter_ffi::main_get_login_device_info().0;
-    let device_info = serde_json::from_str::<Value>(&device_info_raw)
-        .unwrap_or_else(|_| json!({}));
+    let device_info = serde_json::from_str::<Value>(&device_info_raw).unwrap_or_else(|_| json!({}));
     let mut body = serde_json::Map::new();
     body.insert("verificationCode".to_string(), code.into());
     if challenge.challenge_type == "totp" {
@@ -3747,11 +4134,9 @@ fn start_account_login_job(username: String, password: String) -> String {
                 Ok(response) => {
                     handle_account_response(response, &api_server, &username, generation)
                 }
-                Err(message) => background_job_failure(
-                    "runtime_poll_account_action",
-                    "transport",
-                    message,
-                ),
+                Err(message) => {
+                    background_job_failure("runtime_poll_account_action", "transport", message)
+                }
             }
         },
     )
@@ -3783,19 +4168,15 @@ fn start_account_verification_job(challenge_id: String, code: String) -> String 
                 Some(body),
                 None,
             ) {
-                Ok(response) => {
-                    handle_account_response(
-                        response,
-                        &challenge.api_server,
-                        &challenge.username,
-                        generation,
-                    )
-                }
-                Err(message) => background_job_failure(
-                    "runtime_poll_account_action",
-                    "transport",
-                    message,
+                Ok(response) => handle_account_response(
+                    response,
+                    &challenge.api_server,
+                    &challenge.username,
+                    generation,
                 ),
+                Err(message) => {
+                    background_job_failure("runtime_poll_account_action", "transport", message)
+                }
             }
         },
     )
@@ -3867,10 +4248,7 @@ fn address_book_peer(peer: &Value, include_hash: bool) -> Option<Value> {
         "platform".to_string(),
         json_field_string(peer, "platform").into(),
     );
-    result.insert(
-        "alias".to_string(),
-        json_field_string(peer, "alias").into(),
-    );
+    result.insert("alias".to_string(), json_field_string(peer, "alias").into());
     result.insert("tags".to_string(), json!(string_array(peer.get("tags"))));
     if include_hash {
         let hash = json_field_string(peer, "hash");
@@ -3911,10 +4289,7 @@ fn legacy_address_book_entry(
           "tag_colors": "{}"
         }));
     }
-    let data_raw = body
-        .get("data")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
+    let data_raw = body.get("data").and_then(Value::as_str).unwrap_or_default();
     if data_raw.is_empty() {
         return Ok(json!({
           "guid": "",
@@ -3956,10 +4331,7 @@ fn fetch_shared_address_book_profiles(
         if !address_book_sync_is_current(api_server, access_token, generation) {
             return Err(ADDRESS_BOOK_SUPERSEDED_MESSAGE.to_string());
         }
-        let path = format!(
-            "/api/ab/shared/profiles?current={}&pageSize=100",
-            current
-        );
+        let path = format!("/api/ab/shared/profiles?current={}&pageSize=100", current);
         let response = api_request(api_server, &path, "POST", None, Some(access_token))?;
         if response.status_code == 404 {
             return Ok(profiles);
@@ -4007,10 +4379,7 @@ fn fetch_address_book_peers(
         if !address_book_sync_is_current(api_server, access_token, generation) {
             return Err(ADDRESS_BOOK_SUPERSEDED_MESSAGE.to_string());
         }
-        let path = format!(
-            "/api/ab/peers?current={}&pageSize=100&ab={}",
-            current, guid
-        );
+        let path = format!("/api/ab/peers?current={}&pageSize=100&ab={}", current, guid);
         let response = api_request(api_server, &path, "POST", None, Some(access_token))?;
         let body = require_address_book_success(
             response,
@@ -4098,11 +4467,7 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
     ) {
         Ok(response) => response,
         Err(message) => {
-            return background_job_failure(
-                "runtime_poll_address_book_sync",
-                "transport",
-                message,
-            );
+            return background_job_failure("runtime_poll_address_book_sync", "transport", message);
         }
     };
 
@@ -4114,24 +4479,12 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
                 ADDRESS_BOOK_SUPERSEDED_MESSAGE.to_string(),
             );
         }
-        match api_request(
-            &api_server,
-            "/api/ab",
-            "GET",
-            None,
-            Some(&access_token),
-        )
-        .and_then(|response| {
-            legacy_address_book_entry(response, &api_server, &access_token, generation)
-        })
-        {
+        match api_request(&api_server, "/api/ab", "GET", None, Some(&access_token)).and_then(
+            |response| legacy_address_book_entry(response, &api_server, &access_token, generation),
+        ) {
             Ok(entry) => vec![entry],
             Err(message) => {
-                return background_job_failure(
-                    "runtime_poll_address_book_sync",
-                    "server",
-                    message,
-                );
+                return background_job_failure("runtime_poll_address_book_sync", "server", message);
             }
         }
     } else {
@@ -4144,16 +4497,10 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
         ) {
             Ok(body) => body,
             Err(message) => {
-                return background_job_failure(
-                    "runtime_poll_address_book_sync",
-                    "server",
-                    message,
-                );
+                return background_job_failure("runtime_poll_address_book_sync", "server", message);
             }
         };
-        let personal_guid = json_field_string(&personal_body, "guid")
-            .trim()
-            .to_string();
+        let personal_guid = json_field_string(&personal_body, "guid").trim().to_string();
         if personal_guid.is_empty() {
             return background_job_failure(
                 "runtime_poll_address_book_sync",
@@ -4161,11 +4508,7 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
                 "Personal address book has no guid".to_string(),
             );
         }
-        let mut profiles = vec![(
-            personal_guid.clone(),
-            "My address book".to_string(),
-            true,
-        )];
+        let mut profiles = vec![(personal_guid.clone(), "My address book".to_string(), true)];
         match fetch_shared_address_book_profiles(&api_server, &access_token, generation) {
             Ok(shared) => {
                 for (guid, name) in shared {
@@ -4175,11 +4518,7 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
                 }
             }
             Err(message) => {
-                return background_job_failure(
-                    "runtime_poll_address_book_sync",
-                    "server",
-                    message,
-                );
+                return background_job_failure("runtime_poll_address_book_sync", "server", message);
             }
         }
 
@@ -4208,21 +4547,17 @@ fn sync_address_book(api_server: String, access_token: String, generation: u64) 
                     );
                 }
             };
-            let (tags, tag_colors) = match fetch_address_book_tags(
-                &api_server,
-                &access_token,
-                &guid,
-                generation,
-            ) {
-                Ok(tags) => tags,
-                Err(message) => {
-                    return background_job_failure(
-                        "runtime_poll_address_book_sync",
-                        "server",
-                        message,
-                    );
-                }
-            };
+            let (tags, tag_colors) =
+                match fetch_address_book_tags(&api_server, &access_token, &guid, generation) {
+                    Ok(tags) => tags,
+                    Err(message) => {
+                        return background_job_failure(
+                            "runtime_poll_address_book_sync",
+                            "server",
+                            message,
+                        );
+                    }
+                };
             entries.push(json!({
               "guid": guid,
               "name": name,
@@ -4366,11 +4701,8 @@ fn parse_server_config(raw: &str) -> Result<Value, String> {
         return Err(format!("Unsupported server mode {}", requested_mode));
     }
     let id_server = normalize_server_endpoint(
-        json_raw_string(
-            &payload,
-            &["idServer", "customRendezvousServer", "host"],
-        )
-        .unwrap_or_default(),
+        json_raw_string(&payload, &["idServer", "customRendezvousServer", "host"])
+            .unwrap_or_default(),
     );
     let relay_server = normalize_server_endpoint(
         json_raw_string(&payload, &["relayServer", "relay"]).unwrap_or_default(),
@@ -4395,37 +4727,286 @@ fn parse_server_config(raw: &str) -> Result<Value, String> {
     }))
 }
 
-fn test_server_config(config: &Value) -> Value {
+fn validate_server_config_format(config: &Value) -> Value {
     let id_server = json_field_string(config, "idServer");
     let relay_server = json_field_string(config, "relayServer");
     let api_server = json_field_string(config, "apiServer");
-    let test_with_proxy = config
-        .get("testWithProxy")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let id_error = if id_server.is_empty() {
-        "required".to_string()
+        String::new()
     } else {
-        flutter_ffi::main_test_if_valid_server(id_server, test_with_proxy)
+        validate_socket_target(&id_server, hbb_common::config::RENDEZVOUS_PORT)
+            .err()
+            .unwrap_or_default()
     };
     let relay_error = if relay_server.is_empty() {
         String::new()
     } else {
-        flutter_ffi::main_test_if_valid_server(relay_server, test_with_proxy)
+        validate_socket_target(&relay_server, hbb_common::config::RELAY_PORT)
+            .err()
+            .unwrap_or_default()
     };
-    let api_error = if api_server.is_empty()
-        || api_server.starts_with("http://")
-        || api_server.starts_with("https://")
-    {
+    let api_error = if api_server.is_empty() {
         String::new()
     } else {
-        "invalid_http".to_string()
+        api_socket_target(&api_server)
+            .and_then(|target| validate_normalized_socket_target(&target).map(|_| target))
+            .err()
+            .unwrap_or_default()
     };
     json!({
       "idServer": id_error,
       "relayServer": relay_error,
       "apiServer": api_error
     })
+}
+
+async fn test_server_config(config: &Value) -> Value {
+    let format_errors = validate_server_config_format(config);
+    if !server_config_errors_empty(&format_errors) {
+        return format_errors;
+    }
+    let id_server = json_field_string(config, "idServer");
+    let relay_server = json_field_string(config, "relayServer");
+    let api_server = json_field_string(config, "apiServer");
+    let key = json_field_string(config, "key");
+    let test_with_proxy = config
+        .get("testWithProxy")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let id_target = if id_server.is_empty() {
+        None
+    } else {
+        Some(socket_target(
+            &id_server,
+            hbb_common::config::RENDEZVOUS_PORT as u16,
+        ))
+    };
+    let relay_target = if relay_server.is_empty() {
+        None
+    } else {
+        Some(socket_target(
+            &relay_server,
+            hbb_common::config::RELAY_PORT as u16,
+        ))
+    };
+    let api_url = if api_server.is_empty() {
+        None
+    } else {
+        Some(api_server)
+    };
+    let (id_error, relay_error, api_error) = hbb_common::tokio::join!(
+        test_id_server_response(id_target, test_with_proxy),
+        test_relay_server_response(relay_target, key, test_with_proxy),
+        test_api_server_response(api_url, test_with_proxy),
+    );
+    json!({
+      "idServer": id_error,
+      "relayServer": relay_error,
+      "apiServer": api_error
+    })
+}
+
+fn server_config_has_endpoint(config: &Value) -> bool {
+    !json_field_string(config, "idServer").is_empty()
+        || !json_field_string(config, "relayServer").is_empty()
+        || !json_field_string(config, "apiServer").is_empty()
+}
+
+fn socket_target(value: &str, default_port: u16) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('[') && trimmed.ends_with(']') {
+        return format!("{trimmed}:{default_port}");
+    }
+    hbb_common::socket_client::check_port(trimmed, default_port as i32)
+}
+
+fn validate_socket_target(value: &str, default_port: i32) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("缺少服务器地址".to_string());
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err("地址不能包含空白字符".to_string());
+    }
+    let target = socket_target(trimmed, default_port as u16);
+    validate_normalized_socket_target(&target)?;
+    Ok(target)
+}
+
+fn validate_normalized_socket_target(target: &str) -> Result<(), String> {
+    let Some((host, port)) = hbb_common::socket_client::split_host_port(target) else {
+        return Err("需要有效的主机名和端口".to_string());
+    };
+    let host = host.trim_matches(['[', ']']).trim();
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|character| matches!(character, '/' | '@' | '?' | '#'))
+        || port <= 0
+        || port > u16::MAX as i32
+    {
+        return Err("需要有效的主机名和端口".to_string());
+    }
+    Ok(())
+}
+
+fn api_socket_target(value: &str) -> Result<String, String> {
+    let (rest, default_port) = if let Some(rest) = value.strip_prefix("http://") {
+        (rest, 80)
+    } else if let Some(rest) = value.strip_prefix("https://") {
+        (rest, 443)
+    } else {
+        return Err("需要以 http:// 或 https:// 开头".to_string());
+    };
+    let authority = rest.split('/').next().unwrap_or_default().trim();
+    if authority.is_empty() {
+        return Err("缺少服务器地址".to_string());
+    }
+    Ok(socket_target(authority, default_port))
+}
+
+async fn connect_test_stream(target: String, test_with_proxy: bool) -> Result<Stream, String> {
+    if test_with_proxy {
+        return hbb_common::socket_client::connect_tcp(target, 1_800)
+            .await
+            .map_err(|err| format!("连接失败: {err}"));
+    }
+    match hbb_common::tokio::time::timeout(
+        Duration::from_millis(1_800),
+        hbb_common::tokio::net::TcpStream::connect(target),
+    )
+    .await
+    {
+        Ok(Ok(stream)) => {
+            let peer_addr = stream
+                .peer_addr()
+                .map_err(|err| format!("无法读取服务器地址: {err}"))?;
+            Ok(Stream::from(stream, peer_addr))
+        }
+        Ok(Err(err)) => Err(format!("直连失败: {err}")),
+        Err(_) => Err("直连在 1.8 秒内未完成".to_string()),
+    }
+}
+
+async fn test_id_server_response(target: Option<String>, test_with_proxy: bool) -> String {
+    let Some(target) = target else {
+        return String::new();
+    };
+    let mut stream = match connect_test_stream(target, test_with_proxy).await {
+        Ok(stream) => stream,
+        Err(message) => return message,
+    };
+    let mut request = RendezvousMessage::new();
+    request.set_test_nat_request(TestNatRequest {
+        serial: 0,
+        ..Default::default()
+    });
+    if let Err(err) = stream.send(&request).await {
+        return format!("无法发送 RustDesk ID 探测: {err}");
+    }
+    for _ in 0..2 {
+        let Some(frame) = stream.next_timeout(1_500).await else {
+            return "未收到 RustDesk ID 服务响应".to_string();
+        };
+        let bytes = match frame {
+            Ok(bytes) => bytes,
+            Err(err) => return format!("读取 RustDesk ID 响应失败: {err}"),
+        };
+        let response = match RendezvousMessage::parse_from_bytes(&bytes) {
+            Ok(response) => response,
+            Err(_) => return "服务器返回的不是 RustDesk ID 协议数据".to_string(),
+        };
+        if matches!(
+            response.union,
+            Some(rendezvous_message::Union::TestNatResponse(_))
+        ) {
+            return String::new();
+        }
+    }
+    "服务器未返回 RustDesk ID 探测响应".to_string()
+}
+
+async fn test_relay_server_response(
+    target: Option<String>,
+    key: String,
+    test_with_proxy: bool,
+) -> String {
+    let Some(target) = target else {
+        return String::new();
+    };
+    let mut left = match connect_test_stream(target.clone(), test_with_proxy).await {
+        Ok(stream) => stream,
+        Err(message) => return message,
+    };
+    let mut right = match connect_test_stream(target, test_with_proxy).await {
+        Ok(stream) => stream,
+        Err(message) => return message,
+    };
+    static RELAY_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = RELAY_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let uuid = format!(
+        "server-config-test-{}-{sequence}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    );
+    let mut left_request = RendezvousMessage::new();
+    left_request.set_request_relay(RequestRelay {
+        id: "server-config-test".to_string(),
+        uuid: uuid.clone(),
+        licence_key: key.clone(),
+        ..Default::default()
+    });
+    let mut right_request = RendezvousMessage::new();
+    right_request.set_request_relay(RequestRelay {
+        uuid,
+        licence_key: key,
+        ..Default::default()
+    });
+    if let Err(err) = left.send(&left_request).await {
+        return format!("无法发送 RustDesk Relay 探测: {err}");
+    }
+    if let Err(err) = right.send(&right_request).await {
+        return format!("无法建立第二条 RustDesk Relay 探测连接: {err}");
+    }
+    hbb_common::tokio::time::sleep(Duration::from_millis(80)).await;
+    let marker = format!("rustdesk-relay-test-{sequence}").into_bytes();
+    if let Err(err) = left.send_raw(marker.clone()).await {
+        return format!("无法发送 RustDesk Relay 回环数据: {err}");
+    }
+    for _ in 0..2 {
+        let Some(frame) = right.next_timeout(1_500).await else {
+            return "Relay 服务器未完成 RustDesk 双端转发".to_string();
+        };
+        match frame {
+            Ok(bytes) if bytes.as_ref() == marker.as_slice() => return String::new(),
+            Ok(_) => continue,
+            Err(err) => return format!("读取 RustDesk Relay 回环数据失败: {err}"),
+        }
+    }
+    "Relay 服务器未返回正确的 RustDesk 转发数据".to_string()
+}
+
+async fn test_api_server_response(api_server: Option<String>, test_with_proxy: bool) -> String {
+    let Some(api_server) = api_server else {
+        return String::new();
+    };
+    match hbb_common::tokio::task::spawn_blocking(move || {
+        test_api_server_response_sync(&api_server, test_with_proxy)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => format!("RustDesk API 探测任务失败: {err}"),
+    }
+}
+
+fn test_api_server_response_sync(api_server: &str, test_with_proxy: bool) -> String {
+    match librustdesk::validate_rustdesk_api_server(api_server, test_with_proxy) {
+        Ok(_) => String::new(),
+        Err(err) => format!("RustDesk API 校验失败: {err}"),
+    }
 }
 
 fn server_config_errors_empty(errors: &Value) -> bool {
@@ -4457,19 +5038,23 @@ fn recent_peer_summary(peer: &Value) -> Value {
     })
 }
 
-fn lan_peer_summary(peer: &Value) -> Value {
+fn lan_peer_summary(peer: &Value, recent: &[Value]) -> Value {
     json!({
       "id": json_field_string(peer, "id"),
       "username": json_field_string(peer, "username"),
       "hostname": json_field_string(peer, "hostname"),
       "platform": json_field_string(peer, "platform"),
       "online": peer.get("online").and_then(Value::as_bool).unwrap_or(false),
-      "ip": lan_peer_ip(peer),
+      "ip": lan_peer_ip(peer, recent),
       "ipMac": json_object_field(peer, "ip_mac")
     })
 }
 
-fn lan_peer_ip(peer: &Value) -> String {
+fn lan_peer_ip(peer: &Value, recent: &[Value]) -> String {
+    let id = json_field_string(peer, "id");
+    if let Some(preferred) = lan_preferred_ip_store().lock().unwrap().get(&id).cloned() {
+        return preferred;
+    }
     let mut addresses = peer
         .get("ip_mac")
         .and_then(Value::as_object)
@@ -4481,8 +5066,30 @@ fn lan_peer_ip(peer: &Value) -> String {
         })
         .unwrap_or_default();
     addresses.sort_unstable_by_key(|address| (!address.is_ipv4(), *address));
+    let username = json_field_string(peer, "username");
+    let hostname = json_field_string(peer, "hostname");
+    if let Some(recent_address) = recent.iter().find_map(|row| {
+        let candidate = IpAddr::from_str(&json_field_string(row, "id")).ok()?;
+        if !addresses.contains(&candidate) {
+            return None;
+        }
+        let recent_username = json_field_string(row, "username");
+        let recent_hostname = json_field_string(row, "hostname");
+        ((!username.is_empty() && username == recent_username)
+            || (!hostname.is_empty() && hostname == recent_hostname))
+            .then_some(candidate)
+    }) {
+        return recent_address.to_string();
+    }
+    // Multi-homed peers can answer the same discovery scan from multiple LAN
+    // addresses. Prefer the highest IPv4 candidate when no previously working
+    // recent-session address identifies the route; this avoids deterministically
+    // selecting the oldest/lowest DHCP address from the map.
     addresses
-        .first()
+        .iter()
+        .rev()
+        .find(|address| address.is_ipv4())
+        .or_else(|| addresses.first())
         .map(ToString::to_string)
         .unwrap_or_default()
 }
