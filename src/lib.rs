@@ -15,7 +15,7 @@ use napi_derive_ohos::napi;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    ffi::{c_char, c_void, CStr, CString},
+    ffi::{c_char, c_void, CStr},
     fs,
     net::{IpAddr, SocketAddr, TcpStream},
     slice,
@@ -172,6 +172,10 @@ unsafe extern "C" {
         capture: *mut OH_AVScreenCapture,
         callback: unsafe extern "C" fn(*mut OH_AVScreenCapture, i32, *mut c_void),
         user_data: *mut c_void,
+    ) -> i32;
+    fn OH_AVScreenCapture_SetMicrophoneEnabled(
+        capture: *mut OH_AVScreenCapture,
+        enabled: bool,
     ) -> i32;
     fn OH_AVScreenCapture_StartScreenCapture(capture: *mut OH_AVScreenCapture) -> i32;
     fn OH_AVScreenCapture_StopScreenCapture(capture: *mut OH_AVScreenCapture) -> i32;
@@ -426,6 +430,8 @@ static ACCOUNT_CHALLENGE: OnceLock<Mutex<Option<AccountChallenge>>> = OnceLock::
 static ACCOUNT_CHALLENGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CONTROLLED_RUNTIME: OnceLock<Mutex<ControlledRuntime>> = OnceLock::new();
 static CONTROLLED_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
+static CONTROLLED_AUDIO_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
+static CONTROLLED_CAPTURE_START_PREPARING: AtomicBool = AtomicBool::new(false);
 static CONTROLLED_CAPTURE_FALLBACK_RUNNING: AtomicBool = AtomicBool::new(false);
 static CONTROLLED_CAPTURE_FALLBACK_THREAD: OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     OnceLock::new();
@@ -957,9 +963,65 @@ fn controlled_input_events_from_core(
     }
 }
 
+fn controlled_view_only_config_is_valid(config: &Value) -> bool {
+    !config
+        .get("enableInput")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && !config
+            .get("enableClipboard")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        && config
+            .get("enableAudio")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+}
+
+fn controlled_view_only_permission_is_valid(permission: &str, enabled: bool) -> bool {
+    if permission == "audio" {
+        return enabled;
+    }
+    if matches!(
+        permission,
+        "keyboard" | "clipboard" | "file" | "restart" | "recording"
+    ) {
+        return !enabled;
+    }
+    true
+}
+
 #[cfg(test)]
 mod controlled_input_tests {
     use super::*;
+
+    #[test]
+    fn view_only_host_rejects_input_and_clipboard_escalation() {
+        assert!(controlled_view_only_config_is_valid(&json!({
+            "enableInput": false,
+            "enableClipboard": false,
+            "enableAudio": true
+        })));
+        assert!(!controlled_view_only_config_is_valid(
+            &json!({"enableInput": true})
+        ));
+        assert!(!controlled_view_only_config_is_valid(
+            &json!({"enableClipboard": true})
+        ));
+        assert!(!controlled_view_only_config_is_valid(&json!({
+            "enableInput": false,
+            "enableClipboard": false,
+            "enableAudio": false
+        })));
+        assert!(!controlled_view_only_permission_is_valid("keyboard", true));
+        assert!(!controlled_view_only_permission_is_valid("clipboard", true));
+        assert!(!controlled_view_only_permission_is_valid("file", true));
+        assert!(!controlled_view_only_permission_is_valid("restart", true));
+        assert!(!controlled_view_only_permission_is_valid("recording", true));
+        assert!(!controlled_view_only_permission_is_valid("audio", false));
+        assert!(controlled_view_only_permission_is_valid("keyboard", false));
+        assert!(controlled_view_only_permission_is_valid("audio", true));
+    }
 
     #[test]
     fn wheel_preserves_both_axes_and_normalizes_direction() {
@@ -1081,20 +1143,78 @@ fn controlled_response(action: &str, ok: bool, state: &ControlledRuntime, extra:
     response.to_string()
 }
 
+fn controlled_view_only_denial(action: &str) -> String {
+    json!({
+        "ok": false,
+        "action": action,
+        "message": "HarmonyOS watched/view-only hosting does not expose control or mutable media injection"
+    })
+    .to_string()
+}
+
+#[cfg(target_env = "ohos")]
+fn controlled_capture_state_is_terminal(state_code: i32) -> bool {
+    matches!(state_code, 1 | 2 | 3 | 4 | 10)
+}
+
+#[cfg(target_env = "ohos")]
+unsafe fn schedule_controlled_audio_capture_cleanup(capture: *mut OH_AVScreenCapture) {
+    let handle = capture as usize as u64;
+    if handle == 0
+        || CONTROLLED_AUDIO_CAPTURE_HANDLE
+            .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    std::thread::spawn(move || {
+        let capture = handle as usize as *mut OH_AVScreenCapture;
+        let stop_code = unsafe { OH_AVScreenCapture_StopScreenCapture(capture) };
+        let release_code = unsafe { OH_AVScreenCapture_Release(capture) };
+        CONTROLLED_CAPTURE_HANDLE.store(0, Ordering::Release);
+        stop_controlled_capture_fallback();
+        ohos::stop_host();
+        if stop_code != 0 || release_code != 0 {
+            if release_code != 0 {
+                let _ = CONTROLLED_AUDIO_CAPTURE_HANDLE.compare_exchange(
+                    0,
+                    handle,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+            }
+            if let Ok(mut state) = controlled_runtime().lock() {
+                state.last_error = Some(format!(
+                    "inner audio capture cleanup failed: stop={} release={}",
+                    stop_code, release_code
+                ));
+                state.running = false;
+                state.audio_enabled = false;
+            }
+        } else if let Ok(mut state) = controlled_runtime().lock() {
+            state.running = false;
+            state.audio_enabled = false;
+        }
+    });
+}
+
 #[cfg(target_env = "ohos")]
 unsafe extern "C" fn controlled_capture_state_callback(
-    _capture: *mut OH_AVScreenCapture,
+    capture: *mut OH_AVScreenCapture,
     state_code: i32,
     _user_data: *mut c_void,
 ) {
     if let Ok(mut state) = controlled_runtime().lock() {
         state.native_capture_state = state_code;
     }
+    if controlled_capture_state_is_terminal(state_code) {
+        unsafe { schedule_controlled_audio_capture_cleanup(capture) };
+    }
 }
 
 #[cfg(target_env = "ohos")]
 unsafe extern "C" fn controlled_capture_error_callback(
-    _capture: *mut OH_AVScreenCapture,
+    capture: *mut OH_AVScreenCapture,
     error_code: i32,
     _user_data: *mut c_void,
 ) {
@@ -1102,6 +1222,7 @@ unsafe extern "C" fn controlled_capture_error_callback(
         state.native_capture_error = error_code;
         state.last_error = Some(format!("OH_AVScreenCapture error {}", error_code));
     }
+    unsafe { schedule_controlled_audio_capture_cleanup(capture) };
 }
 
 #[cfg(target_env = "ohos")]
@@ -1188,6 +1309,113 @@ unsafe extern "C" fn controlled_capture_data_callback(
             state.last_error = Some("Core rejected native screen capture frame".to_string());
         }
     }
+}
+
+#[cfg(target_env = "ohos")]
+unsafe fn start_controlled_inner_audio_capture() -> Result<(), String> {
+    if CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0 {
+        return Ok(());
+    }
+    let capture = unsafe { OH_AVScreenCapture_Create() };
+    if capture.is_null() {
+        return Err("OH_AVScreenCapture_Create returned null for inner audio".to_string());
+    }
+    let config = OH_AVScreenCaptureConfig {
+        capture_mode: 0,
+        data_type: 0,
+        audio: OH_AudioInfo {
+            mic: OH_AudioCaptureInfo::default(),
+            inner: OH_AudioCaptureInfo {
+                sample_rate: 48_000,
+                channels: 2,
+                source: 2,
+            },
+            enc: OH_AudioEncInfo::default(),
+        },
+        video: OH_VideoInfo::default(),
+        recorder: OH_RecorderInfo::default(),
+    };
+    let microphone_code = unsafe { OH_AVScreenCapture_SetMicrophoneEnabled(capture, false) };
+    let state_code = unsafe {
+        OH_AVScreenCapture_SetStateCallback(
+            capture,
+            controlled_capture_state_callback,
+            std::ptr::null_mut(),
+        )
+    };
+    let data_code = unsafe {
+        OH_AVScreenCapture_SetDataCallback(
+            capture,
+            controlled_capture_data_callback,
+            std::ptr::null_mut(),
+        )
+    };
+    let error_code = unsafe {
+        OH_AVScreenCapture_SetErrorCallback(
+            capture,
+            controlled_capture_error_callback,
+            std::ptr::null_mut(),
+        )
+    };
+    let init_code = unsafe { OH_AVScreenCapture_Init(capture, config) };
+    if microphone_code != 0
+        || state_code != 0
+        || data_code != 0
+        || error_code != 0
+        || init_code != 0
+    {
+        unsafe {
+            OH_AVScreenCapture_Release(capture);
+        }
+        return Err(format!(
+            "inner audio capture setup failed: microphone={} state={} data={} error={} init={}",
+            microphone_code, state_code, data_code, error_code, init_code
+        ));
+    }
+    let handle = capture as usize as u64;
+    CONTROLLED_AUDIO_CAPTURE_HANDLE.store(handle, Ordering::Release);
+    let start_code = unsafe { OH_AVScreenCapture_StartScreenCapture(capture) };
+    if start_code != 0 {
+        if CONTROLLED_AUDIO_CAPTURE_HANDLE
+            .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            unsafe {
+                OH_AVScreenCapture_Release(capture);
+            }
+        }
+        return Err(format!("inner audio capture start failed: {}", start_code));
+    }
+    if CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != handle {
+        return Err("inner audio capture was interrupted during startup".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_env = "ohos")]
+unsafe fn stop_controlled_inner_audio_capture() -> Result<(i32, i32), String> {
+    let handle = CONTROLLED_AUDIO_CAPTURE_HANDLE.swap(0, Ordering::AcqRel);
+    if handle == 0 {
+        return Ok((0, 0));
+    }
+    let capture = handle as usize as *mut OH_AVScreenCapture;
+    let stop_code = unsafe { OH_AVScreenCapture_StopScreenCapture(capture) };
+    let release_code = unsafe { OH_AVScreenCapture_Release(capture) };
+    if release_code != 0 {
+        let _ = CONTROLLED_AUDIO_CAPTURE_HANDLE.compare_exchange(
+            0,
+            handle,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+    if stop_code != 0 || release_code != 0 {
+        return Err(format!(
+            "inner audio capture stop failed: stop={} release={}",
+            stop_code, release_code
+        ));
+    }
+    Ok((stop_code, release_code))
 }
 
 #[cfg(target_env = "ohos")]
@@ -1909,10 +2137,6 @@ fn core_session_id_for(session_id: &str) -> Option<flutter_ffi::SessionID> {
         .unwrap()
         .get(session_id)
         .and_then(parse_core_session_id)
-}
-
-unsafe extern "C" {
-    fn session_get_rgba(session_uuid_str: *const c_char, display: usize) -> *const u8;
 }
 
 #[napi]
@@ -4547,7 +4771,11 @@ pub fn transfer_next_job_id() -> u32 {
 // the actual RustDesk host lifecycle and protocol state.
 #[napi]
 pub fn controlled_server_start(config_json: String) -> String {
-    let config = match controlled_parse_json("controlled_server_start", &config_json, MAX_CONTROLLED_JSON_BYTES) {
+    let mut config = match controlled_parse_json(
+        "controlled_server_start",
+        &config_json,
+        MAX_CONTROLLED_JSON_BYTES,
+    ) {
         Ok(value) if value.is_object() => value,
         Ok(_) => return json!({"ok":false,"action":"controlled_server_start","message":"config must be a JSON object"}).to_string(),
         Err(message) => return json!({"ok":false,"action":"controlled_server_start","message":message}).to_string(),
@@ -4557,28 +4785,144 @@ pub fn controlled_server_start(config_json: String) -> String {
         .or_else(|| config.get("audioEnabled"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    if !controlled_view_only_config_is_valid(&config) {
+        return json!({
+            "ok": false,
+            "action": "controlled_server_start",
+            "message": "HarmonyOS host currently supports watched/view-only sessions only"
+        })
+        .to_string();
+    }
+    config["enableInput"] = json!(false);
+    config["enableClipboard"] = json!(false);
+    let approve_mode = flutter_ffi::main_get_option("approve-mode".to_string());
+    let approve_mode_fixed = flutter_ffi::main_is_option_fixed("approve-mode".to_string()).0;
+    if approve_mode_fixed && approve_mode != "password" {
+        return json!({
+            "ok": false,
+            "action": "controlled_server_start",
+            "message": "watched/view-only hosting requires password authentication"
+        })
+        .to_string();
+    }
+    if !approve_mode_fixed && approve_mode != "password" {
+        flutter_ffi::main_set_option("approve-mode".to_string(), "password".to_string());
+    }
+    let audio_fixed = controlled_option_fixed("enable-audio");
+    if audio_fixed && !controlled_option_bool("enable-audio") {
+        return json!({
+            "ok": false,
+            "action": "controlled_server_start",
+            "message": "device audio sharing is disabled by policy"
+        })
+        .to_string();
+    }
+    if !audio_fixed {
+        flutter_ffi::main_set_option("enable-audio".to_string(), "Y".to_string());
+    }
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        OH_Input_CancelInjection();
+        CONTROLLED_INPUT_AUTH_STATUS.store(-1, Ordering::Release);
+    }
     CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.store(INPUT_MOUSE_BUTTON_NONE, Ordering::Release);
-    let started_now = ohos::start_host();
+
+    let host_was_started = ohos::host_is_started();
+    let native_capture_healthy = controlled_runtime()
+        .lock()
+        .map(|state| state.native_capture_error == 0 && state.last_error.is_none())
+        .unwrap_or(false);
+    let capture_was_active = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
+        && CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
+        && native_capture_healthy;
+    let screen_config = {
+        let mut state = controlled_runtime().lock().unwrap();
+        state.server_config = config;
+        state.audio_enabled = audio_enabled;
+        state.last_error = None;
+        state.screen_config.clone()
+    };
+    if host_was_started && !capture_was_active {
+        ohos::stop_host();
+        let _ = controlled_screen_capture_stop();
+    }
+    if !capture_was_active
+        && (CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
+            || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0)
+    {
+        let _ = controlled_screen_capture_stop();
+    }
+    if !capture_was_active {
+        {
+            let mut state = controlled_runtime().lock().unwrap();
+            state.running = false;
+            state.audio_enabled = audio_enabled;
+            state.last_error = None;
+        }
+        CONTROLLED_CAPTURE_START_PREPARING.store(true, Ordering::Release);
+        let capture_response = controlled_screen_capture_start(screen_config.to_string());
+        CONTROLLED_CAPTURE_START_PREPARING.store(false, Ordering::Release);
+        let capture_ok = serde_json::from_str::<Value>(&capture_response)
+            .ok()
+            .and_then(|value| value.get("ok").and_then(Value::as_bool))
+            .unwrap_or(false);
+        if !capture_ok {
+            ohos::stop_host();
+            let mut state = controlled_runtime().lock().unwrap();
+            state.running = false;
+            state.audio_enabled = false;
+            state.last_error = Some("screen and inner-audio capture failed to start".to_string());
+            return controlled_response(
+                "controlled_server_start",
+                false,
+                &state,
+                json!({"message":"screen and inner-audio capture failed to start","captureResponse":capture_response}),
+            );
+        }
+    }
+    if !ohos::start_host() || !ohos::host_is_started() {
+        let _ = controlled_screen_capture_stop();
+        ohos::stop_host();
+        let mut state = controlled_runtime().lock().unwrap();
+        state.running = false;
+        state.audio_enabled = false;
+        state.last_error = Some("Core host failed to start".to_string());
+        return controlled_response(
+            "controlled_server_start",
+            false,
+            &state,
+            json!({"message":"Core host failed to start"}),
+        );
+    }
     let mut state = controlled_runtime().lock().unwrap();
-    if !state.running || started_now {
-        state.running = true;
+    state.running = true;
+    if !host_was_started || !capture_was_active {
         state.generation = state.generation.saturating_add(1);
     }
-    state.server_config = config;
-    state.audio_enabled = audio_enabled;
-    state.last_error = None;
     controlled_response(
         "controlled_server_start",
-        ohos::host_is_started(),
+        true,
         &state,
-        json!({"idempotent":!started_now,"coreHostBridgeAvailable":true,"audioEnabled":state.audio_enabled}),
+        json!({"idempotent":host_was_started && capture_was_active,"coreHostBridgeAvailable":true,"audioEnabled":state.audio_enabled,"captureActive":true}),
     )
 }
 
 #[napi]
 pub fn controlled_server_stop() -> String {
-    if CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0 {
-        let _ = controlled_screen_capture_stop();
+    let mut capture_message: Option<String> = None;
+    if CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
+        || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
+    {
+        let response = controlled_screen_capture_stop();
+        if let Ok(value) = serde_json::from_str::<Value>(&response) {
+            if value.get("ok").and_then(Value::as_bool) != Some(true) {
+                capture_message = value
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| Some("screen or inner-audio capture failed to stop".to_string()));
+            }
+        }
     }
     ohos::stop_host();
     CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.store(INPUT_MOUSE_BUTTON_NONE, Ordering::Release);
@@ -4588,11 +4932,19 @@ pub fn controlled_server_stop() -> String {
     state.incoming.clear();
     state.input.clear();
     state.clipboard.clear();
+    let capture_released = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) == 0
+        && CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) == 0;
+    if !capture_released && capture_message.is_none() {
+        capture_message = Some("native capture resources remain allocated".to_string());
+    }
+    if let Some(message) = capture_message.clone() {
+        state.last_error = Some(message);
+    }
     controlled_response(
         "controlled_server_stop",
-        true,
+        capture_released && capture_message.is_none(),
         &state,
-        json!({"idempotent":true}),
+        json!({"idempotent":true,"captureReleased":capture_released,"message":capture_message}),
     )
 }
 
@@ -4600,11 +4952,16 @@ pub fn controlled_server_stop() -> String {
 pub fn controlled_server_get_status() -> String {
     let mut state = controlled_runtime().lock().unwrap();
     state.running = ohos::host_is_started();
+    let audio_policy_enabled = controlled_option_bool("enable-audio");
+    if state.running && !audio_policy_enabled {
+        state.last_error = Some("device audio sharing was disabled by policy".to_string());
+    }
+    let status_healthy = state.running && audio_policy_enabled;
     let (screen_width, screen_height) = ohos::host_screen_size();
     let (clients, _) = controlled_clients_payload();
     controlled_response(
         "controlled_server_get_status",
-        true,
+        status_healthy,
         &state,
         json!({
           "capabilities": state.capabilities,
@@ -4643,7 +5000,12 @@ pub fn controlled_incoming_resolve(request_id: String, accepted: bool) -> String
         return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId must be a numeric Core connection id"}).to_string();
     };
     if accepted {
-        ohos::host_authorize_client(id);
+        return json!({
+            "ok": false,
+            "action": "controlled_incoming_resolve",
+            "message": "password authentication is required before a watched/view-only session can start"
+        })
+        .to_string();
     } else {
         ohos::host_close_client(id);
     }
@@ -4672,6 +5034,14 @@ pub fn controlled_incoming_set_permission(
     ];
     if request_id.trim().is_empty() || !allowed.contains(&permission.as_str()) {
         return json!({"ok":false,"action":"controlled_incoming_set_permission","message":"invalid requestId or permission"}).to_string();
+    }
+    if !controlled_view_only_permission_is_valid(&permission, enabled) {
+        return json!({
+            "ok": false,
+            "action": "controlled_incoming_set_permission",
+            "message": "only screen and audio are available in watched/view-only mode"
+        })
+        .to_string();
     }
     let Ok(id) = request_id.trim().parse::<i32>() else {
         return json!({"ok":false,"action":"controlled_incoming_set_permission","message":"requestId must be a numeric Core connection id"}).to_string();
@@ -4784,12 +5154,6 @@ fn controlled_option_fixed(key: &str) -> bool {
 
 #[napi]
 pub fn controlled_settings_get() -> String {
-    let approve_mode_raw = flutter_ffi::main_get_option("approve-mode".to_string());
-    let approve_mode = match approve_mode_raw.as_str() {
-        "password" => "password",
-        "click" => "click",
-        _ => "both",
-    };
     let temporary_password_length =
         flutter_ffi::main_get_option("temporary-password-length".to_string());
     let temporary_password_length = match temporary_password_length.as_str() {
@@ -4806,12 +5170,12 @@ pub fn controlled_settings_get() -> String {
         true,
         &state,
         json!({
-            "approveMode": approve_mode,
+            "approveMode": "password",
             "temporaryPasswordLength": temporary_password_length,
             "numericOneTimePassword": controlled_option_bool("allow-numeric-one-time-password"),
-            "enableKeyboard": controlled_option_bool("enable-keyboard"),
-            "enableClipboard": controlled_option_bool("enable-clipboard"),
-            "enableAudio": controlled_option_bool("enable-audio"),
+            "enableKeyboard": false,
+            "enableClipboard": false,
+            "enableAudio": true,
             "enableLanDiscovery": controlled_option_bool("enable-lan-discovery"),
             "ipWhitelist": flutter_ffi::main_get_option("whitelist".to_string()),
             "idWhitelist": flutter_ffi::main_get_option("id-whitelist".to_string()),
@@ -4823,12 +5187,12 @@ pub fn controlled_settings_get() -> String {
             "allowRemoteConfigModification": controlled_option_bool("allow-remote-config-modification"),
             "trustedDevicesEnabled": controlled_option_bool("enable-trusted-devices"),
             "fixed": {
-                "approveMode": controlled_option_fixed("approve-mode"),
+                "approveMode": true,
                 "temporaryPasswordLength": controlled_option_fixed("temporary-password-length"),
                 "numericOneTimePassword": controlled_option_fixed("allow-numeric-one-time-password"),
-                "enableKeyboard": controlled_option_fixed("enable-keyboard"),
-                "enableClipboard": controlled_option_fixed("enable-clipboard"),
-                "enableAudio": controlled_option_fixed("enable-audio"),
+                "enableKeyboard": true,
+                "enableClipboard": true,
+                "enableAudio": true,
                 "enableLanDiscovery": controlled_option_fixed("enable-lan-discovery"),
                 "ipWhitelist": controlled_option_fixed("whitelist"),
                 "idWhitelist": controlled_option_fixed("id-whitelist"),
@@ -4850,13 +5214,25 @@ pub fn controlled_setting_set(key: String, value: String) -> String {
     if key.len() > 64 || value.len() > MAX_CONTROLLED_JSON_BYTES {
         return json!({"ok":false,"action":"controlled_setting_set","message":"setting exceeds bounds"}).to_string();
     }
+    if key == "enableKeyboard" || key == "enableClipboard" || key == "enableAudio" {
+        return json!({
+            "ok": false,
+            "action": "controlled_setting_set",
+            "message": "screen and audio are fixed on while input and clipboard are fixed off"
+        })
+        .to_string();
+    }
+    if key == "approveMode" {
+        return json!({
+            "ok": false,
+            "action": "controlled_setting_set",
+            "message": "watched/view-only hosting always requires password authentication"
+        })
+        .to_string();
+    }
     let option = match key.as_str() {
-        "approveMode" => "approve-mode",
         "temporaryPasswordLength" => "temporary-password-length",
         "numericOneTimePassword" => "allow-numeric-one-time-password",
-        "enableKeyboard" => "enable-keyboard",
-        "enableClipboard" => "enable-clipboard",
-        "enableAudio" => "enable-audio",
         "enableLanDiscovery" => "enable-lan-discovery",
         "ipWhitelist" => "whitelist",
         "idWhitelist" => "id-whitelist",
@@ -4873,12 +5249,6 @@ pub fn controlled_setting_set(key: String, value: String) -> String {
         return json!({"ok":false,"action":"controlled_setting_set","message":"setting is fixed by policy"}).to_string();
     }
     let stored = match key.as_str() {
-        "approveMode" => match value.as_str() {
-            "password" => "password".to_string(),
-            "click" => "click".to_string(),
-            "both" => String::new(),
-            _ => return json!({"ok":false,"action":"controlled_setting_set","message":"invalid approve mode"}).to_string(),
-        },
         "temporaryPasswordLength" => match value.as_str() {
             "6" | "8" | "10" => value.clone(),
             _ => return json!({"ok":false,"action":"controlled_setting_set","message":"invalid temporary password length"}).to_string(),
@@ -5055,6 +5425,9 @@ pub fn controlled_screen_push_frame(
     frame: napi_ohos::bindgen_prelude::Uint8Array,
     metadata_json: String,
 ) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_screen_push_frame");
+    }
     if frame.len() > MAX_CONTROLLED_FRAME_BYTES {
         return json!({"ok":false,"action":"controlled_screen_push_frame","message":"frame exceeds 32 MiB"}).to_string();
     }
@@ -5097,6 +5470,9 @@ pub fn controlled_screen_push_frame(
 
 #[napi]
 pub fn controlled_input_poll(limit: u32) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_input_poll");
+    }
     let state = controlled_runtime().lock().unwrap();
     let display_id = state
         .screen_config
@@ -5156,6 +5532,9 @@ pub fn controlled_input_poll(limit: u32) -> String {
 
 #[napi]
 pub fn controlled_input_ack(event_id: String, success: bool) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_input_ack");
+    }
     let state = controlled_runtime().lock().unwrap();
     controlled_response(
         "controlled_input_ack",
@@ -5250,6 +5629,9 @@ unsafe fn controlled_prepare_global_mouse_event(
 
 #[napi]
 pub fn controlled_input_inject_mouse_global(event_json: String) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_input_inject_mouse_global");
+    }
     let event = match controlled_parse_json(
         "controlled_input_inject_mouse_global",
         &event_json,
@@ -5417,6 +5799,9 @@ pub fn controlled_input_inject_mouse_global(event_json: String) -> String {
 
 #[napi]
 pub fn controlled_clipboard_push(content_json: String) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_clipboard_push");
+    }
     let content = match controlled_parse_json(
         "controlled_clipboard_push",
         &content_json,
@@ -5450,6 +5835,9 @@ pub fn controlled_clipboard_push(content_json: String) -> String {
 
 #[napi]
 pub fn controlled_clipboard_poll(limit: u32) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_clipboard_poll");
+    }
     let state = controlled_runtime().lock().unwrap();
     let mut events = Vec::new();
     if limit > 0 {
@@ -5473,6 +5861,9 @@ pub fn controlled_clipboard_poll(limit: u32) -> String {
 
 #[napi]
 pub fn controlled_audio_configure(config_json: String) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_audio_configure");
+    }
     let config = match controlled_parse_json("controlled_audio_configure", &config_json, MAX_CONTROLLED_JSON_BYTES) { Ok(v) if v.is_object() => v, Ok(_) => return json!({"ok":false,"action":"controlled_audio_configure","message":"config must be a JSON object"}).to_string(), Err(m) => return json!({"ok":false,"action":"controlled_audio_configure","message":m}).to_string() };
     let mut state = controlled_runtime().lock().unwrap();
     state.audio_config = config;
@@ -5484,6 +5875,9 @@ pub fn controlled_audio_push_frame(
     frame: napi_ohos::bindgen_prelude::Uint8Array,
     metadata_json: String,
 ) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_audio_push_frame");
+    }
     if frame.len() > MAX_CONTROLLED_FRAME_BYTES {
         return json!({"ok":false,"action":"controlled_audio_push_frame","message":"frame exceeds 32 MiB"}).to_string();
     }
@@ -5515,6 +5909,9 @@ pub fn controlled_audio_push_frame(
 
 #[napi]
 pub fn controlled_audio_set_enabled(enabled: bool) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_audio_set_enabled");
+    }
     let mut state = controlled_runtime().lock().unwrap();
     state.audio_enabled = enabled && state.running;
     controlled_response(
@@ -5527,6 +5924,9 @@ pub fn controlled_audio_set_enabled(enabled: bool) -> String {
 
 #[napi]
 pub fn controlled_device_set_capabilities(capabilities_json: String) -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_device_set_capabilities");
+    }
     let capabilities = match controlled_parse_json("controlled_device_set_capabilities", &capabilities_json, MAX_CONTROLLED_JSON_BYTES) { Ok(v) if v.is_object() => v, Ok(_) => return json!({"ok":false,"action":"controlled_device_set_capabilities","message":"capabilities must be a JSON object"}).to_string(), Err(m) => return json!({"ok":false,"action":"controlled_device_set_capabilities","message":m}).to_string() };
     let mut state = controlled_runtime().lock().unwrap();
     state.capabilities = capabilities;
@@ -5545,7 +5945,7 @@ pub fn controlled_device_get_capabilities() -> String {
         "controlled_device_get_capabilities",
         true,
         &state,
-        json!({"capabilities":state.capabilities,"nativeScreenCapture":{"available":cfg!(target_env = "ohos"),"framesForwardedToCore":true},"inputDialogAuthorization":{"available":cfg!(target_env = "ohos"),"independentOfControlDevice":true}}),
+        json!({"capabilities":state.capabilities,"nativeScreenCapture":{"available":cfg!(target_env = "ohos"),"framesForwardedToCore":true},"inputDialogAuthorization":{"available":false,"independentOfControlDevice":false}}),
     )
 }
 
@@ -5556,8 +5956,16 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
         Ok(_) => return json!({"ok":false,"action":"controlled_screen_capture_start","message":"config must be a JSON object"}).to_string(),
         Err(message) => return json!({"ok":false,"action":"controlled_screen_capture_start","message":message}).to_string(),
     };
-    let width = config.get("width").and_then(Value::as_u64).unwrap_or(0);
-    let height = config.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let stream_width = config.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let stream_height = config.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let width = config
+        .get("sourceWidth")
+        .and_then(Value::as_u64)
+        .unwrap_or(stream_width);
+    let height = config
+        .get("sourceHeight")
+        .and_then(Value::as_u64)
+        .unwrap_or(stream_height);
     let display_id = config.get("displayId").and_then(Value::as_u64).unwrap_or(0);
     let frame_rate = config
         .get("frameRate")
@@ -5567,6 +5975,10 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
         || height == 0
         || width > 16_384
         || height > 16_384
+        || stream_width == 0
+        || stream_height == 0
+        || stream_width > 16_384
+        || stream_height > 16_384
         || display_id > u32::MAX as u64
         || frame_rate == 0
         || frame_rate > 240
@@ -5575,14 +5987,53 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
     }
     #[cfg(target_env = "ohos")]
     unsafe {
+        let preparing = CONTROLLED_CAPTURE_START_PREPARING.load(Ordering::Acquire);
+        let watched_host_running = controlled_runtime()
+            .lock()
+            .map(|state| {
+                state.running
+                    && state.audio_enabled
+                    && controlled_view_only_config_is_valid(&state.server_config)
+            })
+            .unwrap_or(false);
+        if !preparing && (!ohos::host_is_started() || !watched_host_running) {
+            return json!({
+                "ok": false,
+                "action": "controlled_screen_capture_start",
+                "message": "screen capture is bound to the watched/view-only host lifecycle"
+            })
+            .to_string();
+        }
         let existing = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire);
         if existing != 0 {
-            let state = controlled_runtime().lock().unwrap();
+            let healthy = controlled_runtime()
+                .lock()
+                .map(|state| {
+                    state.native_capture_error == 0
+                        && (!state.audio_enabled
+                            || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0)
+                })
+                .unwrap_or(false);
+            if healthy {
+                let state = controlled_runtime().lock().unwrap();
+                return controlled_response(
+                    "controlled_screen_capture_start",
+                    true,
+                    &state,
+                    json!({"idempotent":true,"captureRequested":true}),
+                );
+            }
+            let _ = controlled_screen_capture_stop();
+        }
+        ohos::reset_host_screen();
+        if !ohos::configure_host_screen(stream_width as usize, stream_height as usize) {
+            let mut state = controlled_runtime().lock().unwrap();
+            state.last_error = Some("Core rejected controlled-host screen geometry".to_string());
             return controlled_response(
                 "controlled_screen_capture_start",
-                true,
+                false,
                 &state,
-                json!({"idempotent":true,"captureRequested":true}),
+                json!({"message":"Core rejected controlled-host screen geometry"}),
             );
         }
         // API26 Beta1's AVScreenCapture maps emulator DMA buffers through
@@ -5609,6 +6060,26 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
             state.screenshot_fallback_frames = 0;
             state.screenshot_fallback_errors = 0;
             state.screen_config = config;
+            state.audio_enabled = true;
+            state.last_error = None;
+        }
+        let audio_enabled = controlled_runtime()
+            .lock()
+            .map(|state| state.audio_enabled)
+            .unwrap_or(false);
+        if audio_enabled {
+            if let Err(message) = start_controlled_inner_audio_capture() {
+                CONTROLLED_CAPTURE_HANDLE.store(0, Ordering::Release);
+                ohos::stop_host();
+                let mut state = controlled_runtime().lock().unwrap();
+                state.last_error = Some(message.clone());
+                return controlled_response(
+                    "controlled_screen_capture_start",
+                    false,
+                    &state,
+                    json!({"message":message,"captureRequested":false,"audioEnabled":false}),
+                );
+            }
         }
         start_controlled_capture_fallback_watchdog(display_id as u32);
         let state = controlled_runtime().lock().unwrap();
@@ -5616,7 +6087,7 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
             "controlled_screen_capture_start",
             true,
             &state,
-            json!({"captureRequested":true,"privacyDialogExpected":false,"framesForwardedToCore":true,"innerAudioCaptureConfigured":false,"audioEnabled":false,"captureMode":"display_pixelmap"}),
+            json!({"captureRequested":true,"privacyDialogExpected":false,"framesForwardedToCore":true,"innerAudioCaptureConfigured":audio_enabled,"audioEnabled":audio_enabled,"captureMode":"display_pixelmap_with_inner_audio"}),
         );
     }
     #[cfg(not(target_env = "ohos"))]
@@ -5628,14 +6099,25 @@ pub fn controlled_screen_capture_stop() -> String {
     #[cfg(target_env = "ohos")]
     unsafe {
         let handle = CONTROLLED_CAPTURE_HANDLE.swap(0, Ordering::AcqRel);
+        let audio_result = stop_controlled_inner_audio_capture();
         stop_controlled_capture_fallback();
+        ohos::stop_host();
+        let (audio_stop, audio_release, audio_error) = match audio_result {
+            Ok((stop, release)) => (stop, release, None),
+            Err(message) => (-1, -1, Some(message)),
+        };
         if handle == 0 {
-            let state = controlled_runtime().lock().unwrap();
+            let mut state = controlled_runtime().lock().unwrap();
+            state.running = false;
+            state.audio_enabled = false;
+            if let Some(message) = audio_error.clone() {
+                state.last_error = Some(message);
+            }
             return controlled_response(
                 "controlled_screen_capture_stop",
-                true,
+                audio_error.is_none(),
                 &state,
-                json!({"idempotent":true}),
+                json!({"idempotent":true,"audioStopCode":audio_stop,"audioReleaseCode":audio_release,"message":audio_error}),
             );
         }
         let (stop, release) = if handle == CONTROLLED_CAPTURE_PIXELMAP_HANDLE {
@@ -5649,11 +6131,16 @@ pub fn controlled_screen_capture_stop() -> String {
         };
         let mut state = controlled_runtime().lock().unwrap();
         state.native_capture_state = -1;
+        state.running = false;
+        state.audio_enabled = false;
+        if let Some(message) = audio_error.clone() {
+            state.last_error = Some(message);
+        }
         return controlled_response(
             "controlled_screen_capture_stop",
-            stop == 0 && release == 0,
+            stop == 0 && release == 0 && audio_error.is_none(),
             &state,
-            json!({"stopCode":stop,"releaseCode":release}),
+            json!({"stopCode":stop,"releaseCode":release,"audioStopCode":audio_stop,"audioReleaseCode":audio_release,"message":audio_error}),
         );
     }
     #[cfg(not(target_env = "ohos"))]
@@ -5663,18 +6150,22 @@ pub fn controlled_screen_capture_stop() -> String {
 #[napi]
 pub fn controlled_screen_capture_get_status() -> String {
     let state = controlled_runtime().lock().unwrap();
+    let screen_active = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0;
+    let audio_active = CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0;
+    let capture_active = screen_active && (!state.audio_enabled || audio_active);
+    let capture_healthy = capture_active && state.native_capture_error == 0;
     controlled_response(
         "controlled_screen_capture_get_status",
-        true,
+        capture_healthy,
         &state,
         json!({
-          "available": cfg!(target_env = "ohos"), "active": CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0,
+          "available": cfg!(target_env = "ohos"), "active": capture_active,
           "nativeStateCode":state.native_capture_state,"nativeErrorCode":state.native_capture_error,
           "framesObserved":state.native_capture_frames,"bytesObserved":state.native_capture_bytes,
           "audioFramesObserved":state.native_capture_audio_frames,"audioPcmBytesObserved":state.native_capture_audio_bytes,
           "audioFramesForwarded":state.pushed_audio_frames,"audioEnabled":state.audio_enabled,
           "lastTimestampNs":state.native_capture_last_timestamp,"framesForwardedToCore":true,
-          "innerAudioCaptureConfigured":CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != CONTROLLED_CAPTURE_PIXELMAP_HANDLE,
+          "innerAudioCaptureConfigured":audio_active,
           "captureMode":if state.screenshot_fallback_active { "display_pixelmap_fallback" } else { "avscreen" },
           "screenshotFallbackFrames":state.screenshot_fallback_frames,"screenshotFallbackErrors":state.screenshot_fallback_errors
         }),
@@ -5683,6 +6174,9 @@ pub fn controlled_screen_capture_get_status() -> String {
 
 #[napi]
 pub fn controlled_input_request_authorization() -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_input_request_authorization");
+    }
     #[cfg(target_env = "ohos")]
     unsafe {
         let result = OH_Input_RequestInjection(controlled_input_authorize_callback);
@@ -5694,6 +6188,9 @@ pub fn controlled_input_request_authorization() -> String {
 
 #[napi]
 pub fn controlled_input_get_authorization_status() -> String {
+    if cfg!(target_env = "ohos") {
+        return controlled_view_only_denial("controlled_input_get_authorization_status");
+    }
     #[cfg(target_env = "ohos")]
     unsafe {
         let mut status = -1;
@@ -5734,19 +6231,9 @@ pub fn session_take_rgba_frame(
     let Some(core_session_id) = core_session_id_for(&session_id) else {
         return Vec::new().into();
     };
-    let size = flutter_ffi::session_get_rgba_size(core_session_id, display as usize).0;
-    if size == 0 {
-        return Vec::new().into();
-    }
-    let Ok(core_session_id) = CString::new(core_session_id.to_string()) else {
-        return Vec::new().into();
-    };
-    let frame = unsafe { session_get_rgba(core_session_id.as_ptr(), display as usize) };
-    if frame.is_null() {
-        return Vec::new().into();
-    }
-    let copied = unsafe { slice::from_raw_parts(frame, size).to_vec() };
-    copied.into()
+    flutter_ffi::session_take_rgba_frame(core_session_id, display as usize)
+        .0
+        .into()
 }
 
 #[napi]

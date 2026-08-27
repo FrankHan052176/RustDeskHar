@@ -39,23 +39,9 @@ export function controlledTwoFactorClearTrustedDevices(): string {
   return native.controlledTwoFactorClearTrustedDevices();
 }
 export function controlledScreenConfigure(configJson: string): string { return native.controlledScreenConfigure(configJson); }
-export function controlledScreenPushFrame(frame: Uint8Array, metadataJson: string): string { return native.controlledScreenPushFrame(frame, metadataJson); }
-export function controlledInputPoll(limit: number): string { return native.controlledInputPoll(limit); }
-export function controlledInputAck(eventId: string, success: boolean): string { return native.controlledInputAck(eventId, success); }
-export function controlledInputInjectMouseGlobal(eventJson: string): string { return native.controlledInputInjectMouseGlobal(eventJson); }
-export function controlledClipboardPush(contentJson: string): string { return native.controlledClipboardPush(contentJson); }
-export function controlledClipboardPoll(limit: number): string { return native.controlledClipboardPoll(limit); }
-export function controlledAudioConfigure(configJson: string): string { return native.controlledAudioConfigure(configJson); }
-export function controlledAudioPushFrame(frame: Uint8Array, metadataJson: string): string { return native.controlledAudioPushFrame(frame, metadataJson); }
-export function controlledAudioSetEnabled(enabled: boolean): string { return native.controlledAudioSetEnabled(enabled); }
-export function controlledDeviceSetCapabilities(capabilitiesJson: string): string { return native.controlledDeviceSetCapabilities(capabilitiesJson); }
-export function controlledDeviceGetCapabilities(): string { return native.controlledDeviceGetCapabilities(); }
 export function controlledScreenCaptureStart(configJson: string): string { return native.controlledScreenCaptureStart(configJson); }
 export function controlledScreenCaptureStop(): string { return native.controlledScreenCaptureStop(); }
 export function controlledScreenCaptureGetStatus(): string { return native.controlledScreenCaptureGetStatus(); }
-export function controlledInputRequestAuthorization(): string { return native.controlledInputRequestAuthorization(); }
-export function controlledInputGetAuthorizationStatus(): string { return native.controlledInputGetAuthorizationStatus(); }
-export function controlledInputCancelAuthorization(): string { return native.controlledInputCancelAuthorization(); }
 
 export function inputInterceptorPollEvents(limit: number): string {
   return native.inputInterceptorPollEvents(limit);

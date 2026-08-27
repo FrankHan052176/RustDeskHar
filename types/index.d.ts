@@ -26,23 +26,9 @@ export declare function controlledTwoFactorDisable(): string
 export declare function controlledTwoFactorRemoveTrustedDevices(hwidsJson: string): string
 export declare function controlledTwoFactorClearTrustedDevices(): string
 export declare function controlledScreenConfigure(configJson: string): string
-export declare function controlledScreenPushFrame(frame: Uint8Array, metadataJson: string): string
-export declare function controlledInputPoll(limit: number): string
-export declare function controlledInputAck(eventId: string, success: boolean): string
-export declare function controlledInputInjectMouseGlobal(eventJson: string): string
-export declare function controlledClipboardPush(contentJson: string): string
-export declare function controlledClipboardPoll(limit: number): string
-export declare function controlledAudioConfigure(configJson: string): string
-export declare function controlledAudioPushFrame(frame: Uint8Array, metadataJson: string): string
-export declare function controlledAudioSetEnabled(enabled: boolean): string
-export declare function controlledDeviceSetCapabilities(capabilitiesJson: string): string
-export declare function controlledDeviceGetCapabilities(): string
 export declare function controlledScreenCaptureStart(configJson: string): string
 export declare function controlledScreenCaptureStop(): string
 export declare function controlledScreenCaptureGetStatus(): string
-export declare function controlledInputRequestAuthorization(): string
-export declare function controlledInputGetAuthorizationStatus(): string
-export declare function controlledInputCancelAuthorization(): string
 
 export declare function inputInterceptorPollEvents(limit: number): string
 
