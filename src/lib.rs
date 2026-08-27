@@ -45,6 +45,21 @@ struct OH_AVBuffer {
 }
 #[cfg(target_env = "ohos")]
 #[repr(C)]
+struct OH_NativeBuffer {
+    _private: [u8; 0],
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_NativeBuffer_Config {
+    width: i32,
+    height: i32,
+    format: i32,
+    usage: i32,
+    stride: i32,
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
 struct OH_PixelmapNative {
     _private: [u8; 0],
 }
@@ -187,6 +202,14 @@ unsafe extern "C" {
 unsafe extern "C" {
     fn OH_AVBuffer_GetAddr(buffer: *mut OH_AVBuffer) -> *mut u8;
     fn OH_AVBuffer_GetCapacity(buffer: *mut OH_AVBuffer) -> i32;
+    fn OH_AVBuffer_GetNativeBuffer(buffer: *mut OH_AVBuffer) -> *mut OH_NativeBuffer;
+}
+
+#[cfg(target_env = "ohos")]
+#[link(name = "native_buffer")]
+unsafe extern "C" {
+    fn OH_NativeBuffer_GetConfig(buffer: *mut OH_NativeBuffer, config: *mut OH_NativeBuffer_Config);
+    fn OH_NativeBuffer_Unreference(buffer: *mut OH_NativeBuffer) -> i32;
 }
 
 #[cfg(target_env = "ohos")]
@@ -432,6 +455,7 @@ static CONTROLLED_RUNTIME: OnceLock<Mutex<ControlledRuntime>> = OnceLock::new();
 static CONTROLLED_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
 static CONTROLLED_AUDIO_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
 static CONTROLLED_CAPTURE_START_PREPARING: AtomicBool = AtomicBool::new(false);
+static CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static CONTROLLED_CAPTURE_FALLBACK_RUNNING: AtomicBool = AtomicBool::new(false);
 static CONTROLLED_CAPTURE_FALLBACK_THREAD: OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
     OnceLock::new();
@@ -457,7 +481,7 @@ const MAX_CONTROLLED_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTROLLED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTROLLED_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CONTROLLED_PASSWORD_BYTES: usize = 256;
-const CONTROLLED_CAPTURE_PIXELMAP_HANDLE: u64 = 1;
+const CONTROLLED_CAPTURE_LOGICAL_HANDLE: u64 = 1;
 const CONTROLLED_PIXELMAP_MAX_DIMENSION: usize = 1_920;
 const CONTROLLED_CAPTURE_FALLBACK_FRAME_INTERVAL: Duration = Duration::from_millis(200);
 const CONTROLLED_CAPTURE_FALLBACK_START_DELAY: Duration = Duration::from_millis(1200);
@@ -504,6 +528,7 @@ struct ControlledRuntime {
     pushed_screen_frames: u64,
     pushed_audio_frames: u64,
     native_capture_state: i32,
+    native_capture_started: bool,
     native_capture_error: i32,
     native_capture_frames: u64,
     native_capture_bytes: u64,
@@ -518,6 +543,30 @@ struct ControlledRuntime {
 
 fn controlled_runtime() -> &'static Mutex<ControlledRuntime> {
     CONTROLLED_RUNTIME.get_or_init(|| Mutex::new(ControlledRuntime::default()))
+}
+
+#[cfg(target_env = "ohos")]
+fn controlled_native_capture_is_healthy() -> bool {
+    if CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS.load(Ordering::Acquire)
+        || CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) == 0
+        || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) == 0
+    {
+        return false;
+    }
+    controlled_runtime()
+        .lock()
+        .map(|state| {
+            state.native_capture_error == 0
+                && state.native_capture_started
+                && state.native_capture_frames > 0
+                && state.last_error.is_none()
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_env = "ohos"))]
+fn controlled_native_capture_is_healthy() -> bool {
+    false
 }
 
 fn controlled_parse_json(action: &str, input: &str, max_bytes: usize) -> Result<Value, String> {
@@ -1154,17 +1203,28 @@ fn controlled_view_only_denial(action: &str) -> String {
 
 #[cfg(target_env = "ohos")]
 fn controlled_capture_state_is_terminal(state_code: i32) -> bool {
-    matches!(state_code, 1 | 2 | 3 | 4 | 10)
+    // 11 and 13 are pause states on newer systems. A watched host must not
+    // continue serving stale frames while system capture is paused.
+    matches!(state_code, 1 | 2 | 3 | 4 | 10 | 11 | 13)
 }
 
 #[cfg(target_env = "ohos")]
-unsafe fn schedule_controlled_audio_capture_cleanup(capture: *mut OH_AVScreenCapture) {
+unsafe fn schedule_controlled_capture_cleanup(capture: *mut OH_AVScreenCapture) {
     let handle = capture as usize as u64;
-    if handle == 0
-        || CONTROLLED_AUDIO_CAPTURE_HANDLE
-            .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+    if handle == 0 {
+        return;
+    }
+    if CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
     {
+        return;
+    }
+    if CONTROLLED_AUDIO_CAPTURE_HANDLE
+        .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS.store(false, Ordering::Release);
         return;
     }
     std::thread::spawn(move || {
@@ -1176,25 +1236,29 @@ unsafe fn schedule_controlled_audio_capture_cleanup(capture: *mut OH_AVScreenCap
         ohos::stop_host();
         if stop_code != 0 || release_code != 0 {
             if release_code != 0 {
-                let _ = CONTROLLED_AUDIO_CAPTURE_HANDLE.compare_exchange(
-                    0,
-                    handle,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+                if CONTROLLED_AUDIO_CAPTURE_HANDLE
+                    .compare_exchange(0, handle, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    CONTROLLED_CAPTURE_HANDLE
+                        .store(CONTROLLED_CAPTURE_LOGICAL_HANDLE, Ordering::Release);
+                }
             }
             if let Ok(mut state) = controlled_runtime().lock() {
                 state.last_error = Some(format!(
-                    "inner audio capture cleanup failed: stop={} release={}",
+                    "screen and inner-audio capture cleanup failed: stop={} release={}",
                     stop_code, release_code
                 ));
                 state.running = false;
                 state.audio_enabled = false;
+                state.native_capture_started = false;
             }
         } else if let Ok(mut state) = controlled_runtime().lock() {
             state.running = false;
             state.audio_enabled = false;
+            state.native_capture_started = false;
         }
+        CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS.store(false, Ordering::Release);
     });
 }
 
@@ -1204,11 +1268,20 @@ unsafe extern "C" fn controlled_capture_state_callback(
     state_code: i32,
     _user_data: *mut c_void,
 ) {
+    let handle = capture as usize as u64;
+    if handle == 0 || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != handle {
+        return;
+    }
     if let Ok(mut state) = controlled_runtime().lock() {
         state.native_capture_state = state_code;
+        if state_code == 0 {
+            state.native_capture_started = true;
+        } else if controlled_capture_state_is_terminal(state_code) {
+            state.native_capture_started = false;
+        }
     }
     if controlled_capture_state_is_terminal(state_code) {
-        unsafe { schedule_controlled_audio_capture_cleanup(capture) };
+        unsafe { schedule_controlled_capture_cleanup(capture) };
     }
 }
 
@@ -1218,21 +1291,30 @@ unsafe extern "C" fn controlled_capture_error_callback(
     error_code: i32,
     _user_data: *mut c_void,
 ) {
+    let handle = capture as usize as u64;
+    if handle == 0 || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != handle {
+        return;
+    }
     if let Ok(mut state) = controlled_runtime().lock() {
         state.native_capture_error = error_code;
+        state.native_capture_started = false;
         state.last_error = Some(format!("OH_AVScreenCapture error {}", error_code));
     }
-    unsafe { schedule_controlled_audio_capture_cleanup(capture) };
+    unsafe { schedule_controlled_capture_cleanup(capture) };
 }
 
 #[cfg(target_env = "ohos")]
 unsafe extern "C" fn controlled_capture_data_callback(
-    _capture: *mut OH_AVScreenCapture,
+    capture: *mut OH_AVScreenCapture,
     buffer: *mut OH_AVBuffer,
     buffer_type: i32,
     timestamp: i64,
     _user_data: *mut c_void,
 ) {
+    let handle = capture as usize as u64;
+    if handle == 0 || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != handle {
+        return;
+    }
     if buffer.is_null() || (buffer_type != 0 && buffer_type != 1) {
         return;
     }
@@ -1249,7 +1331,7 @@ unsafe extern "C" fn controlled_capture_data_callback(
         if !audio_enabled {
             return;
         }
-        // API26 original inner-audio buffers are PCM S16LE. The native buffer is
+        // Original inner-audio buffers are PCM S16LE. The native buffer is
         // callback-owned, so convert complete stereo frames into an owned f32 LE
         // byte vector and synchronously hand it to Core before returning.
         let input = unsafe { slice::from_raw_parts(addr, capacity as usize) };
@@ -1291,37 +1373,75 @@ unsafe extern "C" fn controlled_capture_data_callback(
         })
         .unwrap_or_default();
     let expected_bytes = width.saturating_mul(height).saturating_mul(4);
-    let forwarded = if expected_bytes > 0 && expected_bytes <= capacity as usize {
-        // OH_AVBuffer remains valid for this callback. Core synchronously copies
-        // the exact frame into its own latest-frame slot before this call returns.
-        let exact_rgba = unsafe { slice::from_raw_parts(addr, expected_bytes) };
-        ohos::push_host_screen_frame_rgba(exact_rgba, width, height)
-    } else {
-        false
-    };
-    if let Ok(mut state) = controlled_runtime().lock() {
-        state.native_capture_frames = state.native_capture_frames.saturating_add(1);
-        state.native_capture_bytes = state
-            .native_capture_bytes
-            .saturating_add(expected_bytes as u64);
-        state.native_capture_last_timestamp = timestamp;
-        if !forwarded {
-            state.last_error = Some("Core rejected native screen capture frame".to_string());
+    let native_buffer = unsafe { OH_AVBuffer_GetNativeBuffer(buffer) };
+    let mut packed_rgba = Vec::new();
+    if !native_buffer.is_null() && expected_bytes > 0 {
+        let mut native_config = OH_NativeBuffer_Config::default();
+        unsafe { OH_NativeBuffer_GetConfig(native_buffer, &mut native_config) };
+        let row_bytes = width.saturating_mul(4);
+        let stride = usize::try_from(native_config.stride).unwrap_or(0);
+        let native_width = usize::try_from(native_config.width).unwrap_or(0);
+        let native_height = usize::try_from(native_config.height).unwrap_or(0);
+        let required_bytes = stride
+            .saturating_mul(height.saturating_sub(1))
+            .saturating_add(row_bytes);
+        if row_bytes > 0
+            && stride >= row_bytes
+            && native_width >= width
+            && native_height >= height
+            && required_bytes <= capacity as usize
+            && expected_bytes <= MAX_CONTROLLED_FRAME_BYTES
+        {
+            let source = unsafe { slice::from_raw_parts(addr, capacity as usize) };
+            packed_rgba.reserve_exact(expected_bytes);
+            for row in 0..height {
+                let start = row.saturating_mul(stride);
+                packed_rgba.extend_from_slice(&source[start..start + row_bytes]);
+            }
         }
+        unsafe {
+            OH_NativeBuffer_Unreference(native_buffer);
+        }
+    }
+    let forwarded = packed_rgba.len() == expected_bytes
+        && ohos::push_host_screen_frame_rgba(&packed_rgba, width, height);
+    if let Ok(mut state) = controlled_runtime().lock() {
+        if forwarded {
+            state.native_capture_frames = state.native_capture_frames.saturating_add(1);
+            state.native_capture_bytes = state
+                .native_capture_bytes
+                .saturating_add(expected_bytes as u64);
+            state.native_capture_last_timestamp = timestamp;
+        } else {
+            state.native_capture_error = -1;
+            state.native_capture_started = false;
+            state.last_error = Some("Invalid or rejected native screen capture frame".to_string());
+        }
+    }
+    if !forwarded {
+        unsafe { schedule_controlled_capture_cleanup(capture) };
     }
 }
 
 #[cfg(target_env = "ohos")]
-unsafe fn start_controlled_inner_audio_capture() -> Result<(), String> {
+unsafe fn start_controlled_av_capture(
+    width: i32,
+    height: i32,
+    display_id: u64,
+    frame_rate: i32,
+) -> Result<(), String> {
+    if CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS.load(Ordering::Acquire) {
+        return Err("previous screen capture cleanup is still in progress".to_string());
+    }
     if CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0 {
         return Ok(());
     }
     let capture = unsafe { OH_AVScreenCapture_Create() };
     if capture.is_null() {
-        return Err("OH_AVScreenCapture_Create returned null for inner audio".to_string());
+        return Err("OH_AVScreenCapture_Create returned null".to_string());
     }
     let config = OH_AVScreenCaptureConfig {
-        capture_mode: 0,
+        capture_mode: 1,
         data_type: 0,
         audio: OH_AudioInfo {
             mic: OH_AudioCaptureInfo::default(),
@@ -1332,7 +1452,21 @@ unsafe fn start_controlled_inner_audio_capture() -> Result<(), String> {
             },
             enc: OH_AudioEncInfo::default(),
         },
-        video: OH_VideoInfo::default(),
+        video: OH_VideoInfo {
+            capture: OH_VideoCaptureInfo {
+                display_id,
+                mission_ids: std::ptr::null_mut(),
+                mission_ids_len: 0,
+                width,
+                height,
+                source: 2,
+            },
+            enc: OH_VideoEncInfo {
+                codec: 0,
+                bitrate: 0,
+                frame_rate,
+            },
+        },
         recorder: OH_RecorderInfo::default(),
     };
     let microphone_code = unsafe { OH_AVScreenCapture_SetMicrophoneEnabled(capture, false) };
@@ -1368,7 +1502,7 @@ unsafe fn start_controlled_inner_audio_capture() -> Result<(), String> {
             OH_AVScreenCapture_Release(capture);
         }
         return Err(format!(
-            "inner audio capture setup failed: microphone={} state={} data={} error={} init={}",
+            "screen and inner-audio capture setup failed: microphone={} state={} data={} error={} init={}",
             microphone_code, state_code, data_code, error_code, init_code
         ));
     }
@@ -1384,16 +1518,55 @@ unsafe fn start_controlled_inner_audio_capture() -> Result<(), String> {
                 OH_AVScreenCapture_Release(capture);
             }
         }
-        return Err(format!("inner audio capture start failed: {}", start_code));
+        return Err(format!(
+            "screen and inner-audio capture start failed: {}",
+            start_code
+        ));
     }
-    if CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != handle {
-        return Err("inner audio capture was interrupted during startup".to_string());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != handle {
+            return Err(
+                "screen and inner-audio capture was interrupted during startup".to_string(),
+            );
+        }
+        let (started, frames, native_error, last_error) = controlled_runtime()
+            .lock()
+            .map(|state| {
+                (
+                    state.native_capture_started,
+                    state.native_capture_frames,
+                    state.native_capture_error,
+                    state.last_error.clone(),
+                )
+            })
+            .unwrap_or((false, 0, -1, Some("capture state lock failed".to_string())));
+        if native_error != 0 {
+            return Err(last_error.unwrap_or_else(|| {
+                format!("screen capture failed with native error {}", native_error)
+            }));
+        }
+        if started && frames > 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            if CONTROLLED_AUDIO_CAPTURE_HANDLE
+                .compare_exchange(handle, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                unsafe {
+                    OH_AVScreenCapture_StopScreenCapture(capture);
+                    OH_AVScreenCapture_Release(capture);
+                }
+            }
+            return Err("system screen capture confirmation or first frame timed out".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    Ok(())
 }
 
 #[cfg(target_env = "ohos")]
-unsafe fn stop_controlled_inner_audio_capture() -> Result<(i32, i32), String> {
+unsafe fn stop_controlled_av_capture() -> Result<(i32, i32), String> {
     let handle = CONTROLLED_AUDIO_CAPTURE_HANDLE.swap(0, Ordering::AcqRel);
     if handle == 0 {
         return Ok((0, 0));
@@ -1411,7 +1584,7 @@ unsafe fn stop_controlled_inner_audio_capture() -> Result<(i32, i32), String> {
     }
     if stop_code != 0 || release_code != 0 {
         return Err(format!(
-            "inner audio capture stop failed: stop={} release={}",
+            "screen and inner-audio capture stop failed: stop={} release={}",
             stop_code, release_code
         ));
     }
@@ -4766,7 +4939,7 @@ pub fn transfer_next_job_id() -> u32 {
     next.parse::<u32>().unwrap_or(0)
 }
 
-// API26 2-in-1 controlled-device host surface. The state machine is deliberately
+// HarmonyOS controlled-device host surface. The state machine is deliberately
 // owned by the HAR so repeated UI lifecycle calls are idempotent while Core owns
 // the actual RustDesk host lifecycle and protocol state.
 #[napi]
@@ -4828,13 +5001,7 @@ pub fn controlled_server_start(config_json: String) -> String {
     CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.store(INPUT_MOUSE_BUTTON_NONE, Ordering::Release);
 
     let host_was_started = ohos::host_is_started();
-    let native_capture_healthy = controlled_runtime()
-        .lock()
-        .map(|state| state.native_capture_error == 0 && state.last_error.is_none())
-        .unwrap_or(false);
-    let capture_was_active = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
-        && CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
-        && native_capture_healthy;
+    let capture_was_active = controlled_native_capture_is_healthy();
     let screen_config = {
         let mut state = controlled_runtime().lock().unwrap();
         state.server_config = config;
@@ -4880,7 +5047,21 @@ pub fn controlled_server_start(config_json: String) -> String {
             );
         }
     }
-    if !ohos::start_host() || !ohos::host_is_started() {
+    if !controlled_native_capture_is_healthy() {
+        let _ = controlled_screen_capture_stop();
+        ohos::stop_host();
+        let mut state = controlled_runtime().lock().unwrap();
+        state.running = false;
+        state.audio_enabled = false;
+        state.last_error = Some("capture became unavailable before host startup".to_string());
+        return controlled_response(
+            "controlled_server_start",
+            false,
+            &state,
+            json!({"message":"capture became unavailable before host startup"}),
+        );
+    }
+    if !ohos::start_host() || !ohos::host_is_started() || !controlled_native_capture_is_healthy() {
         let _ = controlled_screen_capture_stop();
         ohos::stop_host();
         let mut state = controlled_runtime().lock().unwrap();
@@ -5391,10 +5572,8 @@ pub fn controlled_screen_configure(config_json: String) -> String {
     if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
         return json!({"ok":false,"action":"controlled_screen_configure","message":"width and height must be within 1..16384"}).to_string();
     }
-    // The API26 emulator's only reliable backend is the CPU PixelMap path. Keep
-    // its VP8 stream bounded so desktop decoders receive frames promptly while
-    // retaining the source aspect ratio. The full display is still sampled;
-    // only the frame handed to Core is normalized.
+    // Keep the RGBA stream bounded so desktop decoders receive frames promptly
+    // while retaining the source aspect ratio.
     let (stream_width, stream_height) =
         controlled_pixelmap_stream_size(width as usize, height as usize);
     let previous = ohos::host_screen_size();
@@ -5987,6 +6166,14 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
     }
     #[cfg(target_env = "ohos")]
     unsafe {
+        if CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS.load(Ordering::Acquire) {
+            return json!({
+                "ok": false,
+                "action": "controlled_screen_capture_start",
+                "message": "previous screen capture cleanup is still in progress"
+            })
+            .to_string();
+        }
         let preparing = CONTROLLED_CAPTURE_START_PREPARING.load(Ordering::Acquire);
         let watched_host_running = controlled_runtime()
             .lock()
@@ -6010,6 +6197,8 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
                 .lock()
                 .map(|state| {
                     state.native_capture_error == 0
+                        && state.native_capture_started
+                        && state.native_capture_frames > 0
                         && (!state.audio_enabled
                             || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0)
                 })
@@ -6036,12 +6225,11 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
                 json!({"message":"Core rejected controlled-host screen geometry"}),
             );
         }
-        // API26 Beta1's AVScreenCapture maps emulator DMA buffers through
-        // ExpressMmap. That mapping fails and, while the capture session stays
-        // active, the display manager privacy path returns a full black frame
-        // even to the CPU PixelMap fallback. Use the permission-mediated
-        // display PixelMap backend directly on this API26 controlled-host path.
-        CONTROLLED_CAPTURE_HANDLE.store(CONTROLLED_CAPTURE_PIXELMAP_HANDLE, Ordering::Release);
+        // The regular AVScreenCapture session owns the system privacy prompt.
+        // CUSTOM_SCREEN_RECORDING is intentionally not required: it is only an
+        // optional restricted permission for suppressing that prompt on
+        // supported PC/2in1 products.
+        CONTROLLED_CAPTURE_HANDLE.store(CONTROLLED_CAPTURE_LOGICAL_HANDLE, Ordering::Release);
         let configured_size = ohos::host_screen_size();
         if configured_size.0 > 0 && configured_size.1 > 0 {
             config["sourceWidth"] = json!(width);
@@ -6051,6 +6239,8 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
         }
         {
             let mut state = controlled_runtime().lock().unwrap();
+            state.native_capture_state = -1;
+            state.native_capture_started = false;
             state.native_capture_error = 0;
             state.native_capture_frames = 0;
             state.native_capture_bytes = 0;
@@ -6068,9 +6258,13 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
             .map(|state| state.audio_enabled)
             .unwrap_or(false);
         if audio_enabled {
-            if let Err(message) = start_controlled_inner_audio_capture() {
-                CONTROLLED_CAPTURE_HANDLE.store(0, Ordering::Release);
-                ohos::stop_host();
+            if let Err(message) = start_controlled_av_capture(
+                configured_size.0 as i32,
+                configured_size.1 as i32,
+                display_id,
+                frame_rate as i32,
+            ) {
+                let _ = controlled_screen_capture_stop();
                 let mut state = controlled_runtime().lock().unwrap();
                 state.last_error = Some(message.clone());
                 return controlled_response(
@@ -6081,13 +6275,12 @@ pub fn controlled_screen_capture_start(config_json: String) -> String {
                 );
             }
         }
-        start_controlled_capture_fallback_watchdog(display_id as u32);
         let state = controlled_runtime().lock().unwrap();
         return controlled_response(
             "controlled_screen_capture_start",
             true,
             &state,
-            json!({"captureRequested":true,"privacyDialogExpected":false,"framesForwardedToCore":true,"innerAudioCaptureConfigured":audio_enabled,"audioEnabled":audio_enabled,"captureMode":"display_pixelmap_with_inner_audio"}),
+            json!({"captureRequested":true,"privacyDialogExpected":true,"framesForwardedToCore":true,"innerAudioCaptureConfigured":audio_enabled,"audioEnabled":audio_enabled,"captureMode":"avscreen_original_stream"}),
         );
     }
     #[cfg(not(target_env = "ohos"))]
@@ -6099,17 +6292,21 @@ pub fn controlled_screen_capture_stop() -> String {
     #[cfg(target_env = "ohos")]
     unsafe {
         let handle = CONTROLLED_CAPTURE_HANDLE.swap(0, Ordering::AcqRel);
-        let audio_result = stop_controlled_inner_audio_capture();
+        let audio_result = stop_controlled_av_capture();
         stop_controlled_capture_fallback();
         ohos::stop_host();
         let (audio_stop, audio_release, audio_error) = match audio_result {
             Ok((stop, release)) => (stop, release, None),
             Err(message) => (-1, -1, Some(message)),
         };
+        if audio_error.is_some() && CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0 {
+            CONTROLLED_CAPTURE_HANDLE.store(CONTROLLED_CAPTURE_LOGICAL_HANDLE, Ordering::Release);
+        }
         if handle == 0 {
             let mut state = controlled_runtime().lock().unwrap();
             state.running = false;
             state.audio_enabled = false;
+            state.native_capture_started = false;
             if let Some(message) = audio_error.clone() {
                 state.last_error = Some(message);
             }
@@ -6120,7 +6317,7 @@ pub fn controlled_screen_capture_stop() -> String {
                 json!({"idempotent":true,"audioStopCode":audio_stop,"audioReleaseCode":audio_release,"message":audio_error}),
             );
         }
-        let (stop, release) = if handle == CONTROLLED_CAPTURE_PIXELMAP_HANDLE {
+        let (stop, release) = if handle == CONTROLLED_CAPTURE_LOGICAL_HANDLE {
             (0, 0)
         } else {
             let capture = handle as usize as *mut OH_AVScreenCapture;
@@ -6131,6 +6328,7 @@ pub fn controlled_screen_capture_stop() -> String {
         };
         let mut state = controlled_runtime().lock().unwrap();
         state.native_capture_state = -1;
+        state.native_capture_started = false;
         state.running = false;
         state.audio_enabled = false;
         if let Some(message) = audio_error.clone() {
@@ -6153,7 +6351,10 @@ pub fn controlled_screen_capture_get_status() -> String {
     let screen_active = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0;
     let audio_active = CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0;
     let capture_active = screen_active && (!state.audio_enabled || audio_active);
-    let capture_healthy = capture_active && state.native_capture_error == 0;
+    let capture_healthy = capture_active
+        && state.native_capture_error == 0
+        && state.native_capture_started
+        && state.native_capture_frames > 0;
     controlled_response(
         "controlled_screen_capture_get_status",
         capture_healthy,
@@ -6161,6 +6362,7 @@ pub fn controlled_screen_capture_get_status() -> String {
         json!({
           "available": cfg!(target_env = "ohos"), "active": capture_active,
           "nativeStateCode":state.native_capture_state,"nativeErrorCode":state.native_capture_error,
+          "systemCaptureConfirmed":state.native_capture_started,
           "framesObserved":state.native_capture_frames,"bytesObserved":state.native_capture_bytes,
           "audioFramesObserved":state.native_capture_audio_frames,"audioPcmBytesObserved":state.native_capture_audio_bytes,
           "audioFramesForwarded":state.pushed_audio_frames,"audioEnabled":state.audio_enabled,
