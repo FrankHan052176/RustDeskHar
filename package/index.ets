@@ -12,6 +12,51 @@ export function healthcheck(): string {
   return native.healthcheck();
 }
 
+export function controlledServerStart(configJson: string): string { return native.controlledServerStart(configJson); }
+export function controlledServerStop(): string { return native.controlledServerStop(); }
+export function controlledServerGetStatus(): string { return native.controlledServerGetStatus(); }
+export function controlledIncomingPoll(limit: number): string { return native.controlledIncomingPoll(limit); }
+export function controlledIncomingResolve(requestId: string, accepted: boolean): string { return native.controlledIncomingResolve(requestId, accepted); }
+export function controlledIncomingSetPermission(requestId: string, permission: string, enabled: boolean): string { return native.controlledIncomingSetPermission(requestId, permission, enabled); }
+export function controlledPasswordGet(): string { return native.controlledPasswordGet(); }
+export function controlledPasswordRefresh(): string { return native.controlledPasswordRefresh(); }
+export function controlledPasswordSetPermanent(password: string): string { return native.controlledPasswordSetPermanent(password); }
+export function controlledPasswordSetVerificationMethod(method: string): string {
+  return native.controlledPasswordSetVerificationMethod(method);
+}
+export function controlledSettingsGet(): string { return native.controlledSettingsGet(); }
+export function controlledSettingSet(key: string, value: string): string {
+  return native.controlledSettingSet(key, value);
+}
+export function controlledTwoFactorGet(): string { return native.controlledTwoFactorGet(); }
+export function controlledTwoFactorBegin(): string { return native.controlledTwoFactorBegin(); }
+export function controlledTwoFactorVerify(code: string): string { return native.controlledTwoFactorVerify(code); }
+export function controlledTwoFactorDisable(): string { return native.controlledTwoFactorDisable(); }
+export function controlledTwoFactorRemoveTrustedDevices(hwidsJson: string): string {
+  return native.controlledTwoFactorRemoveTrustedDevices(hwidsJson);
+}
+export function controlledTwoFactorClearTrustedDevices(): string {
+  return native.controlledTwoFactorClearTrustedDevices();
+}
+export function controlledScreenConfigure(configJson: string): string { return native.controlledScreenConfigure(configJson); }
+export function controlledScreenPushFrame(frame: Uint8Array, metadataJson: string): string { return native.controlledScreenPushFrame(frame, metadataJson); }
+export function controlledInputPoll(limit: number): string { return native.controlledInputPoll(limit); }
+export function controlledInputAck(eventId: string, success: boolean): string { return native.controlledInputAck(eventId, success); }
+export function controlledInputInjectMouseGlobal(eventJson: string): string { return native.controlledInputInjectMouseGlobal(eventJson); }
+export function controlledClipboardPush(contentJson: string): string { return native.controlledClipboardPush(contentJson); }
+export function controlledClipboardPoll(limit: number): string { return native.controlledClipboardPoll(limit); }
+export function controlledAudioConfigure(configJson: string): string { return native.controlledAudioConfigure(configJson); }
+export function controlledAudioPushFrame(frame: Uint8Array, metadataJson: string): string { return native.controlledAudioPushFrame(frame, metadataJson); }
+export function controlledAudioSetEnabled(enabled: boolean): string { return native.controlledAudioSetEnabled(enabled); }
+export function controlledDeviceSetCapabilities(capabilitiesJson: string): string { return native.controlledDeviceSetCapabilities(capabilitiesJson); }
+export function controlledDeviceGetCapabilities(): string { return native.controlledDeviceGetCapabilities(); }
+export function controlledScreenCaptureStart(configJson: string): string { return native.controlledScreenCaptureStart(configJson); }
+export function controlledScreenCaptureStop(): string { return native.controlledScreenCaptureStop(); }
+export function controlledScreenCaptureGetStatus(): string { return native.controlledScreenCaptureGetStatus(); }
+export function controlledInputRequestAuthorization(): string { return native.controlledInputRequestAuthorization(); }
+export function controlledInputGetAuthorizationStatus(): string { return native.controlledInputGetAuthorizationStatus(); }
+export function controlledInputCancelAuthorization(): string { return native.controlledInputCancelAuthorization(); }
+
 export function inputInterceptorPollEvents(limit: number): string {
   return native.inputInterceptorPollEvents(limit);
 }

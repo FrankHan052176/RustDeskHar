@@ -7,6 +7,43 @@ export declare function buildMarker(): string
 
 export declare function healthcheck(): string
 
+export declare function controlledServerStart(configJson: string): string
+export declare function controlledServerStop(): string
+export declare function controlledServerGetStatus(): string
+export declare function controlledIncomingPoll(limit: number): string
+export declare function controlledIncomingResolve(requestId: string, accepted: boolean): string
+export declare function controlledIncomingSetPermission(requestId: string, permission: string, enabled: boolean): string
+export declare function controlledPasswordGet(): string
+export declare function controlledPasswordRefresh(): string
+export declare function controlledPasswordSetPermanent(password: string): string
+export declare function controlledPasswordSetVerificationMethod(method: string): string
+export declare function controlledSettingsGet(): string
+export declare function controlledSettingSet(key: string, value: string): string
+export declare function controlledTwoFactorGet(): string
+export declare function controlledTwoFactorBegin(): string
+export declare function controlledTwoFactorVerify(code: string): string
+export declare function controlledTwoFactorDisable(): string
+export declare function controlledTwoFactorRemoveTrustedDevices(hwidsJson: string): string
+export declare function controlledTwoFactorClearTrustedDevices(): string
+export declare function controlledScreenConfigure(configJson: string): string
+export declare function controlledScreenPushFrame(frame: Uint8Array, metadataJson: string): string
+export declare function controlledInputPoll(limit: number): string
+export declare function controlledInputAck(eventId: string, success: boolean): string
+export declare function controlledInputInjectMouseGlobal(eventJson: string): string
+export declare function controlledClipboardPush(contentJson: string): string
+export declare function controlledClipboardPoll(limit: number): string
+export declare function controlledAudioConfigure(configJson: string): string
+export declare function controlledAudioPushFrame(frame: Uint8Array, metadataJson: string): string
+export declare function controlledAudioSetEnabled(enabled: boolean): string
+export declare function controlledDeviceSetCapabilities(capabilitiesJson: string): string
+export declare function controlledDeviceGetCapabilities(): string
+export declare function controlledScreenCaptureStart(configJson: string): string
+export declare function controlledScreenCaptureStop(): string
+export declare function controlledScreenCaptureGetStatus(): string
+export declare function controlledInputRequestAuthorization(): string
+export declare function controlledInputGetAuthorizationStatus(): string
+export declare function controlledInputCancelAuthorization(): string
+
 export declare function inputInterceptorPollEvents(limit: number): string
 
 export declare function inputInterceptorStart(): string
