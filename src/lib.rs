@@ -452,6 +452,7 @@ static ADDRESS_BOOK_JOB: OnceLock<Mutex<BackgroundJsonJob>> = OnceLock::new();
 static ACCOUNT_CHALLENGE: OnceLock<Mutex<Option<AccountChallenge>>> = OnceLock::new();
 static ACCOUNT_CHALLENGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 static CONTROLLED_RUNTIME: OnceLock<Mutex<ControlledRuntime>> = OnceLock::new();
+static CONTROLLED_HOST_LIFECYCLE: OnceLock<Mutex<()>> = OnceLock::new();
 static CONTROLLED_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
 static CONTROLLED_AUDIO_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
 static CONTROLLED_CAPTURE_START_PREPARING: AtomicBool = AtomicBool::new(false);
@@ -545,6 +546,10 @@ fn controlled_runtime() -> &'static Mutex<ControlledRuntime> {
     CONTROLLED_RUNTIME.get_or_init(|| Mutex::new(ControlledRuntime::default()))
 }
 
+fn controlled_host_lifecycle() -> &'static Mutex<()> {
+    CONTROLLED_HOST_LIFECYCLE.get_or_init(|| Mutex::new(()))
+}
+
 #[cfg(target_env = "ohos")]
 fn controlled_native_capture_is_healthy() -> bool {
     if CONTROLLED_CAPTURE_CLEANUP_IN_PROGRESS.load(Ordering::Acquire)
@@ -577,7 +582,7 @@ fn controlled_parse_json(action: &str, input: &str, max_bytes: usize) -> Result<
         .map_err(|err| format!("{} payload is invalid JSON: {}", action, err))
 }
 
-fn controlled_clients_payload() -> (Vec<Value>, Vec<Value>) {
+fn controlled_clients_payload(generation: u64) -> (Vec<Value>, Vec<Value>) {
     let raw =
         serde_json::from_str::<Value>(&ohos::host_clients_state()).unwrap_or_else(|_| json!([]));
     let clients = raw
@@ -585,11 +590,13 @@ fn controlled_clients_payload() -> (Vec<Value>, Vec<Value>) {
         .into_iter()
         .flatten()
         .map(|client| {
+            let id = client.get("id").and_then(Value::as_i64).unwrap_or_default();
             json!({
-              "requestId":client.get("id").and_then(Value::as_i64).unwrap_or_default().to_string(),
+              "requestId":format!("{}:{}", generation, id),
               "peerId":client.get("peer_id").and_then(Value::as_str).unwrap_or_default(),
               "peerName":client.get("name").and_then(Value::as_str).unwrap_or_default(),
-              "authorized":client.get("authorized").and_then(Value::as_bool).unwrap_or(false)
+              "authorized":client.get("authorized").and_then(Value::as_bool).unwrap_or(false),
+              "disconnected":client.get("disconnected").and_then(Value::as_bool).unwrap_or(false)
             })
         })
         .collect::<Vec<_>>();
@@ -600,6 +607,10 @@ fn controlled_clients_payload() -> (Vec<Value>, Vec<Value>) {
                 .get("authorized")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                && !client
+                    .get("disconnected")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
         })
         .cloned()
         .collect();
@@ -4944,6 +4955,7 @@ pub fn transfer_next_job_id() -> u32 {
 // the actual RustDesk host lifecycle and protocol state.
 #[napi]
 pub fn controlled_server_start(config_json: String) -> String {
+    let _lifecycle = controlled_host_lifecycle().lock().unwrap();
     let mut config = match controlled_parse_json(
         "controlled_server_start",
         &config_json,
@@ -4968,18 +4980,19 @@ pub fn controlled_server_start(config_json: String) -> String {
     }
     config["enableInput"] = json!(false);
     config["enableClipboard"] = json!(false);
+    config["requireLocalApproval"] = json!(true);
     let approve_mode = flutter_ffi::main_get_option("approve-mode".to_string());
     let approve_mode_fixed = flutter_ffi::main_is_option_fixed("approve-mode".to_string()).0;
-    if approve_mode_fixed && approve_mode != "password" {
+    if approve_mode_fixed && approve_mode != "both" {
         return json!({
             "ok": false,
             "action": "controlled_server_start",
-            "message": "watched/view-only hosting requires password authentication"
+            "message": "watched/view-only hosting requires both password and local-click approval modes"
         })
         .to_string();
     }
-    if !approve_mode_fixed && approve_mode != "password" {
-        flutter_ffi::main_set_option("approve-mode".to_string(), "password".to_string());
+    if !approve_mode_fixed && approve_mode != "both" {
+        flutter_ffi::main_set_option("approve-mode".to_string(), "both".to_string());
     }
     let audio_fixed = controlled_option_fixed("enable-audio");
     if audio_fixed && !controlled_option_bool("enable-audio") {
@@ -5084,12 +5097,18 @@ pub fn controlled_server_start(config_json: String) -> String {
         "controlled_server_start",
         true,
         &state,
-        json!({"idempotent":host_was_started && capture_was_active,"coreHostBridgeAvailable":true,"audioEnabled":state.audio_enabled,"captureActive":true}),
+        json!({"idempotent":host_was_started && capture_was_active,"coreHostBridgeAvailable":true,"audioEnabled":state.audio_enabled,"captureActive":true,"manualApprovalRequired":true}),
     )
 }
 
 #[napi]
 pub fn controlled_server_stop() -> String {
+    let _lifecycle = controlled_host_lifecycle().lock().unwrap();
+    {
+        let mut state = controlled_runtime().lock().unwrap();
+        state.running = false;
+        state.generation = state.generation.saturating_add(1);
+    }
     let mut capture_message: Option<String> = None;
     if CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
         || CONTROLLED_AUDIO_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
@@ -5139,7 +5158,7 @@ pub fn controlled_server_get_status() -> String {
     }
     let status_healthy = state.running && audio_policy_enabled;
     let (screen_width, screen_height) = ohos::host_screen_size();
-    let (clients, _) = controlled_clients_payload();
+    let (clients, _) = controlled_clients_payload(state.generation);
     controlled_response(
         "controlled_server_get_status",
         status_healthy,
@@ -5150,7 +5169,7 @@ pub fn controlled_server_get_status() -> String {
           "screenFramesPushed": state.pushed_screen_frames,
           "audioFramesPushed": state.pushed_audio_frames,
           "queueDepths": {"incoming":state.incoming.len(),"input":state.input.len(),"clipboard":state.clipboard.len()},
-          "coreHostBridgeAvailable":true,"clientCount":ohos::host_client_count(),"clients":clients,
+          "coreHostBridgeAvailable":true,"clientCount":ohos::host_client_count(),"clients":clients,"manualApprovalRequired":true,
           "state":if state.running { "ready" } else { "disabled" },"serverRunning":state.running,
           "myId":flutter_ffi::main_get_my_id(),"temporaryPassword":flutter_ffi::main_get_temporary_password(),
           "screenSize":{"width":screen_width,"height":screen_height}
@@ -5161,36 +5180,51 @@ pub fn controlled_server_get_status() -> String {
 #[napi]
 pub fn controlled_incoming_poll(limit: u32) -> String {
     let state = controlled_runtime().lock().unwrap();
-    let (mut clients, mut requests) = controlled_clients_payload();
+    let (mut clients, mut requests) = controlled_clients_payload(state.generation);
     clients.truncate(limit.min(MAX_CONTROLLED_QUEUE_ITEMS as u32) as usize);
     requests.truncate(limit.min(MAX_CONTROLLED_QUEUE_ITEMS as u32) as usize);
     controlled_response(
         "controlled_incoming_poll",
         true,
         &state,
-        json!({"clients":clients,"requests":requests,"clientCount":ohos::host_client_count()}),
+        json!({"clients":clients,"requests":requests,"clientCount":ohos::host_client_count(),"manualApprovalRequired":true}),
     )
 }
 
 #[napi]
 pub fn controlled_incoming_resolve(request_id: String, accepted: bool) -> String {
+    let _lifecycle = controlled_host_lifecycle().lock().unwrap();
     if request_id.trim().is_empty() || request_id.len() > 256 {
         return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId must contain 1..256 bytes"}).to_string();
     }
-    let Ok(id) = request_id.trim().parse::<i32>() else {
-        return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId must be a numeric Core connection id"}).to_string();
+    let Some((generation_text, id_text)) = request_id.trim().split_once(':') else {
+        return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId must contain host generation and Core connection id"}).to_string();
     };
-    if accepted {
+    let (Ok(generation), Ok(id)) = (generation_text.parse::<u64>(), id_text.parse::<i32>()) else {
+        return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId contains an invalid host generation or Core connection id"}).to_string();
+    };
+    let state = controlled_runtime().lock().unwrap();
+    if !state.running || state.generation != generation || !ohos::host_is_started() {
         return json!({
             "ok": false,
             "action": "controlled_incoming_resolve",
-            "message": "password authentication is required before a watched/view-only session can start"
+            "message": "request belongs to a stale or stopped host generation"
         })
         .to_string();
-    } else {
-        ohos::host_close_client(id);
     }
-    let state = controlled_runtime().lock().unwrap();
+    let forwarded = if accepted {
+        ohos::host_authorize_client(id)
+    } else {
+        ohos::host_close_client(id)
+    };
+    if !forwarded {
+        return json!({
+            "ok": false,
+            "action": "controlled_incoming_resolve",
+            "message": "request is stale or its Core connection is no longer available"
+        })
+        .to_string();
+    }
     controlled_response(
         "controlled_incoming_resolve",
         state.running,
@@ -5351,7 +5385,7 @@ pub fn controlled_settings_get() -> String {
         true,
         &state,
         json!({
-            "approveMode": "password",
+            "approveMode": "both",
             "temporaryPasswordLength": temporary_password_length,
             "numericOneTimePassword": controlled_option_bool("allow-numeric-one-time-password"),
             "enableKeyboard": false,
@@ -5407,7 +5441,7 @@ pub fn controlled_setting_set(key: String, value: String) -> String {
         return json!({
             "ok": false,
             "action": "controlled_setting_set",
-            "message": "watched/view-only hosting always requires password authentication"
+            "message": "watched/view-only hosting always offers local approval or password authentication"
         })
         .to_string();
     }
