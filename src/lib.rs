@@ -3034,20 +3034,23 @@ pub fn runtime_set_favorite(peer_id: String, favorite: bool) -> String {
 
 #[napi]
 pub fn runtime_scan_lan_peers() -> String {
+    let _scan = lan_scan_execution_lock().lock().unwrap();
     // A LAN address is volatile transport metadata. Start every explicit scan
     // from an empty snapshot so an offline device cannot keep presenting an
     // obsolete IP after DHCP/network changes.
     let previous_peers = hbb_common::config::LanPeers::load().peers;
     migrate_legacy_lan_passwords(&previous_peers);
+    let generation = LAN_SCAN_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    {
+        let mut resolution = lan_scan_resolution_store().lock().unwrap();
+        resolution.generation = 0;
+        resolution.ips.clear();
+    }
     hbb_common::config::LanPeers::store(&[]);
-    lan_preferred_ip_store().lock().unwrap().clear();
-    let generation = LAN_SCAN_GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let recent_raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
-    let recent = parse_json_list(&recent_raw, "recent LAN candidates").unwrap_or_default();
     flutter_ffi::main_discover();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(3_100));
-        resolve_lan_preferred_ips(generation, &recent);
+        resolve_lan_preferred_ips(generation);
     });
     json!({
       "ok": true,
@@ -3061,62 +3064,59 @@ pub fn runtime_scan_lan_peers() -> String {
 
 static LAN_SCAN_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-fn lan_preferred_ip_store() -> &'static Mutex<HashMap<String, String>> {
-    static STORE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+fn lan_scan_execution_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn resolve_lan_preferred_ips(generation: u64, recent: &[Value]) {
-    if LAN_SCAN_GENERATION.load(Ordering::Relaxed) != generation {
-        return;
-    }
-    let peers = hbb_common::config::LanPeers::load().peers;
-    let mut resolved = HashMap::new();
-    for peer in peers {
-        let mut discovered = peer.ip_mac.keys().cloned().collect::<Vec<_>>();
-        discovered.sort_by(|left, right| right.cmp(left));
-        discovered.dedup();
-        let recent_candidate = recent_lan_candidate(&peer, recent);
-        if let Some(candidate) = &recent_candidate {
-            migrate_peer_password(&peer.id, candidate);
+#[derive(Default)]
+struct LanScanResolution {
+    generation: u64,
+    ips: HashMap<String, String>,
+}
+
+fn lan_scan_resolution_store() -> &'static Mutex<LanScanResolution> {
+    static STORE: OnceLock<Mutex<LanScanResolution>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(LanScanResolution::default()))
+}
+
+fn resolve_lan_preferred_ips(generation: u64) {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if LAN_SCAN_GENERATION.load(Ordering::Acquire) != generation {
+            return;
         }
-        let mut candidates = Vec::new();
-        if let Some(candidate) = recent_candidate {
-            candidates.push(candidate);
-        }
-        for candidate in &discovered {
-            if !candidates.contains(candidate) {
-                candidates.push(candidate.clone());
+        let peers = hbb_common::config::LanPeers::load().peers;
+        let mut resolved = HashMap::new();
+        for peer in &peers {
+            let mut discovered = peer.ip_mac.keys().cloned().collect::<Vec<_>>();
+            discovered.sort_by(|left, right| right.cmp(left));
+            discovered.dedup();
+            if let Some(preferred) = discovered
+                .iter()
+                .find(|candidate| lan_direct_port_responds(candidate))
+                .cloned()
+            {
+                resolved.insert(peer.id.clone(), preferred);
             }
         }
-        let preferred = candidates
-            .iter()
-            .find(|candidate| lan_direct_port_responds(candidate))
-            .cloned()
-            .or_else(|| discovered.first().cloned());
-        if let Some(preferred) = preferred {
-            resolved.insert(peer.id, preferred);
+        if LAN_SCAN_GENERATION.load(Ordering::Acquire) != generation {
+            return;
         }
+        let mut resolution = lan_scan_resolution_store().lock().unwrap();
+        if LAN_SCAN_GENERATION.load(Ordering::Acquire) == generation {
+            resolution.generation = generation;
+            resolution.ips = resolved;
+        }
+        drop(resolution);
+        if Instant::now() >= deadline {
+            return;
+        }
+        // Discovery responses and direct listeners can settle at slightly
+        // different times. Keep resolving the current generation so late
+        // addresses can become visible without ever falling back to old data.
+        std::thread::sleep(Duration::from_millis(250));
     }
-    if LAN_SCAN_GENERATION.load(Ordering::Relaxed) == generation {
-        *lan_preferred_ip_store().lock().unwrap() = resolved;
-    }
-}
-
-fn recent_lan_candidate(
-    peer: &hbb_common::config::DiscoveryPeer,
-    recent: &[Value],
-) -> Option<String> {
-    recent.iter().find_map(|row| {
-        let candidate = json_field_string(row, "id");
-        IpAddr::from_str(&candidate).ok()?;
-        let recent_username = json_field_string(row, "username");
-        let recent_hostname = json_field_string(row, "hostname");
-        let username_match = !peer.username.is_empty() && peer.username == recent_username;
-        let hostname_match = !peer.hostname.is_empty() && peer.hostname == recent_hostname;
-        let same_identity = username_match || hostname_match;
-        same_identity.then_some(candidate)
-    })
 }
 
 fn lan_direct_port_responds(ip: &str) -> bool {
@@ -3125,21 +3125,6 @@ fn lan_direct_port_responds(ip: &str) -> bool {
     };
     let target = SocketAddr::new(ip, hbb_common::config::WS_RENDEZVOUS_PORT as u16);
     TcpStream::connect_timeout(&target, Duration::from_millis(250)).is_ok()
-}
-
-fn migrate_peer_password(peer_id: &str, legacy_target: &str) {
-    if peer_id.is_empty() || legacy_target.is_empty() {
-        return;
-    }
-    let mut stable_config = hbb_common::config::PeerConfig::load(peer_id);
-    if !stable_config.password.is_empty() {
-        return;
-    }
-    let legacy_config = hbb_common::config::PeerConfig::load(legacy_target);
-    if !legacy_config.password.is_empty() {
-        stable_config.password = legacy_config.password;
-        stable_config.store(peer_id);
-    }
 }
 
 fn migrate_legacy_lan_passwords(peers: &[hbb_common::config::DiscoveryPeer]) {
@@ -8284,9 +8269,28 @@ fn lan_peer_summary(peer: &Value, recent: &[Value]) -> Value {
 
 fn lan_peer_ip(peer: &Value, recent: &[Value]) -> String {
     let id = json_field_string(peer, "id");
-    if let Some(preferred) = lan_preferred_ip_store().lock().unwrap().get(&id).cloned() {
-        return preferred;
+    // Once an explicit refresh has started, expose only an address that was
+    // discovered and reached during that same generation. The resolution lock
+    // and generation check make refresh/list linearizable: no prior generation
+    // can leak an old recent-session IP while a new scan is in progress.
+    let resolution = lan_scan_resolution_store().lock().unwrap();
+    let generation = LAN_SCAN_GENERATION.load(Ordering::Acquire);
+    if generation != 0 {
+        if resolution.generation != generation {
+            return String::new();
+        }
+        if let Some(preferred) = resolution.ips.get(&id) {
+            let still_discovered = peer
+                .get("ip_mac")
+                .and_then(Value::as_object)
+                .is_some_and(|addresses| addresses.contains_key(preferred));
+            if still_discovered {
+                return preferred.clone();
+            }
+        }
+        return String::new();
     }
+    drop(resolution);
     let mut addresses = peer
         .get("ip_mac")
         .and_then(Value::as_object)
