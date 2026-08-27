@@ -1,5 +1,8 @@
 use hbb_common::{
-    message_proto::{message as peer_message, Message as PeerMessage},
+    message_proto::{
+        message as peer_message, Clipboard, ClipboardFormat, Message as PeerMessage,
+        MultiClipboards,
+    },
     protobuf::Message as _,
     rendezvous_proto::{rendezvous_message, RendezvousMessage, RequestRelay, TestNatRequest},
     Stream,
@@ -18,7 +21,7 @@ use std::{
     slice,
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Duration, Instant},
@@ -27,6 +30,203 @@ use std::{
 #[repr(C)]
 struct OH_AVCapability {
     _private: [u8; 0],
+}
+
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+struct OH_AVScreenCapture {
+    _private: [u8; 0],
+}
+
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+struct OH_AVBuffer {
+    _private: [u8; 0],
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+struct OH_PixelmapNative {
+    _private: [u8; 0],
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+struct OH_Pixelmap_ImageInfo {
+    _private: [u8; 0],
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_AudioCaptureInfo {
+    sample_rate: i32,
+    channels: i32,
+    source: i32,
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_AudioEncInfo {
+    bitrate: i32,
+    codec: i32,
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_AudioInfo {
+    mic: OH_AudioCaptureInfo,
+    inner: OH_AudioCaptureInfo,
+    enc: OH_AudioEncInfo,
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OH_VideoCaptureInfo {
+    display_id: u64,
+    mission_ids: *mut i32,
+    mission_ids_len: i32,
+    width: i32,
+    height: i32,
+    source: i32,
+}
+#[cfg(target_env = "ohos")]
+impl Default for OH_VideoCaptureInfo {
+    fn default() -> Self {
+        Self {
+            display_id: 0,
+            mission_ids: std::ptr::null_mut(),
+            mission_ids_len: 0,
+            width: 0,
+            height: 0,
+            source: 0,
+        }
+    }
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_VideoEncInfo {
+    codec: i32,
+    bitrate: i32,
+    frame_rate: i32,
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_VideoInfo {
+    capture: OH_VideoCaptureInfo,
+    enc: OH_VideoEncInfo,
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct OH_RecorderInfo {
+    url: *mut c_char,
+    url_len: u32,
+    format: i32,
+}
+#[cfg(target_env = "ohos")]
+impl Default for OH_RecorderInfo {
+    fn default() -> Self {
+        Self {
+            url: std::ptr::null_mut(),
+            url_len: 0,
+            format: 0,
+        }
+    }
+}
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct OH_AVScreenCaptureConfig {
+    capture_mode: i32,
+    data_type: i32,
+    audio: OH_AudioInfo,
+    video: OH_VideoInfo,
+    recorder: OH_RecorderInfo,
+}
+
+#[cfg(target_env = "ohos")]
+#[link(name = "native_avscreen_capture")]
+unsafe extern "C" {
+    fn OH_AVScreenCapture_Create() -> *mut OH_AVScreenCapture;
+    fn OH_AVScreenCapture_Init(
+        capture: *mut OH_AVScreenCapture,
+        config: OH_AVScreenCaptureConfig,
+    ) -> i32;
+    fn OH_AVScreenCapture_SetStateCallback(
+        capture: *mut OH_AVScreenCapture,
+        callback: unsafe extern "C" fn(*mut OH_AVScreenCapture, i32, *mut c_void),
+        user_data: *mut c_void,
+    ) -> i32;
+    fn OH_AVScreenCapture_SetDataCallback(
+        capture: *mut OH_AVScreenCapture,
+        callback: unsafe extern "C" fn(
+            *mut OH_AVScreenCapture,
+            *mut OH_AVBuffer,
+            i32,
+            i64,
+            *mut c_void,
+        ),
+        user_data: *mut c_void,
+    ) -> i32;
+    fn OH_AVScreenCapture_SetErrorCallback(
+        capture: *mut OH_AVScreenCapture,
+        callback: unsafe extern "C" fn(*mut OH_AVScreenCapture, i32, *mut c_void),
+        user_data: *mut c_void,
+    ) -> i32;
+    fn OH_AVScreenCapture_StartScreenCapture(capture: *mut OH_AVScreenCapture) -> i32;
+    fn OH_AVScreenCapture_StopScreenCapture(capture: *mut OH_AVScreenCapture) -> i32;
+    fn OH_AVScreenCapture_Release(capture: *mut OH_AVScreenCapture) -> i32;
+}
+
+#[cfg(target_env = "ohos")]
+#[link(name = "native_media_core")]
+unsafe extern "C" {
+    fn OH_AVBuffer_GetAddr(buffer: *mut OH_AVBuffer) -> *mut u8;
+    fn OH_AVBuffer_GetCapacity(buffer: *mut OH_AVBuffer) -> i32;
+}
+
+#[cfg(target_env = "ohos")]
+#[link(name = "native_display_manager")]
+unsafe extern "C" {
+    fn OH_NativeDisplayManager_CaptureScreenPixelmap(
+        display_id: u32,
+        pixelmap: *mut *mut OH_PixelmapNative,
+    ) -> i32;
+}
+
+#[cfg(target_env = "ohos")]
+#[link(name = "pixelmap")]
+unsafe extern "C" {
+    fn OH_PixelmapImageInfo_Create(info: *mut *mut OH_Pixelmap_ImageInfo) -> i32;
+    fn OH_PixelmapImageInfo_GetWidth(info: *mut OH_Pixelmap_ImageInfo, width: *mut u32) -> i32;
+    fn OH_PixelmapImageInfo_GetHeight(info: *mut OH_Pixelmap_ImageInfo, height: *mut u32) -> i32;
+    fn OH_PixelmapImageInfo_GetRowStride(
+        info: *mut OH_Pixelmap_ImageInfo,
+        row_stride: *mut u32,
+    ) -> i32;
+    fn OH_PixelmapImageInfo_GetPixelFormat(
+        info: *mut OH_Pixelmap_ImageInfo,
+        pixel_format: *mut i32,
+    ) -> i32;
+    fn OH_PixelmapImageInfo_Release(info: *mut OH_Pixelmap_ImageInfo) -> i32;
+    fn OH_PixelmapNative_GetImageInfo(
+        pixelmap: *mut OH_PixelmapNative,
+        info: *mut OH_Pixelmap_ImageInfo,
+    ) -> i32;
+    fn OH_PixelmapNative_ReadPixels(
+        pixelmap: *mut OH_PixelmapNative,
+        destination: *mut u8,
+        buffer_size: *mut usize,
+    ) -> i32;
+    fn OH_PixelmapNative_Release(pixelmap: *mut OH_PixelmapNative) -> i32;
+}
+
+#[cfg(target_env = "ohos")]
+#[link(name = "ohinput")]
+unsafe extern "C" {
+    fn OH_Input_RequestInjection(callback: unsafe extern "C" fn(i32)) -> i32;
+    fn OH_Input_QueryAuthorizedStatus(status: *mut i32) -> i32;
+    fn OH_Input_CancelInjection();
 }
 
 #[repr(C)]
@@ -60,6 +260,26 @@ struct InputKeyEvent {
 }
 
 #[cfg(target_env = "ohos")]
+#[repr(C)]
+struct InputMouseEvent {
+    _private: [u8; 0],
+}
+
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+struct InputTouchEvent {
+    _private: [u8; 0],
+}
+
+#[cfg(target_env = "ohos")]
+#[repr(C)]
+#[derive(Default)]
+struct OhosTimespec {
+    tv_sec: i64,
+    tv_nsec: i64,
+}
+
+#[cfg(target_env = "ohos")]
 #[link(name = "ohinput")]
 unsafe extern "C" {
     fn OH_Input_AddKeyEventInterceptor(
@@ -72,6 +292,29 @@ unsafe extern "C" {
     fn OH_Input_GetKeyEventActionTime(key_event: *const InputKeyEvent) -> i64;
     fn OH_Input_GetKeyEventWindowId(key_event: *const InputKeyEvent) -> i32;
     fn OH_Input_GetKeyEventDisplayId(key_event: *const InputKeyEvent) -> i32;
+    fn OH_Input_CreateMouseEvent() -> *mut InputMouseEvent;
+    fn OH_Input_DestroyMouseEvent(mouse_event: *mut *mut InputMouseEvent);
+    fn OH_Input_SetMouseEventAction(mouse_event: *mut InputMouseEvent, action: i32);
+    fn OH_Input_SetMouseEventDisplayX(mouse_event: *mut InputMouseEvent, display_x: i32);
+    fn OH_Input_SetMouseEventDisplayY(mouse_event: *mut InputMouseEvent, display_y: i32);
+    fn OH_Input_SetMouseEventButton(mouse_event: *mut InputMouseEvent, button: i32);
+    fn OH_Input_SetMouseEventActionTime(mouse_event: *mut InputMouseEvent, action_time: i64);
+    fn OH_Input_SetMouseEventDisplayId(mouse_event: *mut InputMouseEvent, display_id: i32);
+    fn OH_Input_SetMouseEventGlobalX(mouse_event: *mut InputMouseEvent, global_x: i32);
+    fn OH_Input_SetMouseEventGlobalY(mouse_event: *mut InputMouseEvent, global_y: i32);
+    fn OH_Input_InjectMouseEventGlobal(mouse_event: *const InputMouseEvent) -> i32;
+    fn OH_Input_CreateTouchEvent() -> *mut InputTouchEvent;
+    fn OH_Input_DestroyTouchEvent(touch_event: *mut *mut InputTouchEvent) -> i32;
+    fn OH_Input_SetTouchEventAction(touch_event: *mut InputTouchEvent, action: i32);
+    fn OH_Input_SetTouchEventFingerId(touch_event: *mut InputTouchEvent, finger_id: i32);
+    fn OH_Input_SetTouchEventDisplayX(touch_event: *mut InputTouchEvent, display_x: i32);
+    fn OH_Input_SetTouchEventDisplayY(touch_event: *mut InputTouchEvent, display_y: i32);
+    fn OH_Input_SetTouchEventActionTime(touch_event: *mut InputTouchEvent, action_time: i64);
+    fn OH_Input_SetTouchEventDisplayId(touch_event: *mut InputTouchEvent, display_id: i32);
+    fn OH_Input_SetTouchEventGlobalX(touch_event: *mut InputTouchEvent, global_x: i32);
+    fn OH_Input_SetTouchEventGlobalY(touch_event: *mut InputTouchEvent, global_y: i32);
+    fn OH_Input_InjectTouchEventGlobal(touch_event: *const InputTouchEvent) -> i32;
+    fn clock_gettime(clock_id: i32, time: *mut OhosTimespec) -> i32;
 }
 
 // -------- hilog bridge for the Rust core --------
@@ -181,9 +424,41 @@ static ACCOUNT_OPTIONS_JOB: OnceLock<Mutex<BackgroundJsonJob>> = OnceLock::new()
 static ADDRESS_BOOK_JOB: OnceLock<Mutex<BackgroundJsonJob>> = OnceLock::new();
 static ACCOUNT_CHALLENGE: OnceLock<Mutex<Option<AccountChallenge>>> = OnceLock::new();
 static ACCOUNT_CHALLENGE_COUNTER: AtomicU64 = AtomicU64::new(1);
+static CONTROLLED_RUNTIME: OnceLock<Mutex<ControlledRuntime>> = OnceLock::new();
+static CONTROLLED_CAPTURE_HANDLE: AtomicU64 = AtomicU64::new(0);
+static CONTROLLED_CAPTURE_FALLBACK_RUNNING: AtomicBool = AtomicBool::new(false);
+static CONTROLLED_CAPTURE_FALLBACK_THREAD: OnceLock<Mutex<Option<std::thread::JoinHandle<()>>>> =
+    OnceLock::new();
+static CONTROLLED_INPUT_AUTH_STATUS: AtomicI32 = AtomicI32::new(-1);
+static CONTROLLED_INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static CONTROLLED_GLOBAL_MOUSE_X: AtomicI32 = AtomicI32::new(0);
+static CONTROLLED_GLOBAL_MOUSE_Y: AtomicI32 = AtomicI32::new(0);
+static CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON: AtomicI32 = AtomicI32::new(-1);
+static CONTROLLED_GLOBAL_MOUSE_ACTION_TIME: AtomicI64 = AtomicI64::new(0);
+
+const INPUT_MOUSE_ACTION_MOVE: i32 = 1;
+const INPUT_MOUSE_ACTION_BUTTON_DOWN: i32 = 2;
+const INPUT_MOUSE_ACTION_BUTTON_UP: i32 = 3;
+const INPUT_MOUSE_BUTTON_NONE: i32 = -1;
+const INPUT_TOUCH_ACTION_DOWN: i32 = 1;
+const INPUT_TOUCH_ACTION_MOVE: i32 = 2;
+const INPUT_TOUCH_ACTION_UP: i32 = 3;
 
 const MAX_EVENTS_PER_SESSION: usize = 512;
 const MAX_INPUT_EVENTS: usize = 256;
+const MAX_CONTROLLED_QUEUE_ITEMS: usize = 256;
+const MAX_CONTROLLED_JSON_BYTES: usize = 64 * 1024;
+const MAX_CONTROLLED_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CONTROLLED_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CONTROLLED_PASSWORD_BYTES: usize = 256;
+const CONTROLLED_CAPTURE_PIXELMAP_HANDLE: u64 = 1;
+const CONTROLLED_PIXELMAP_MAX_DIMENSION: usize = 1_920;
+const CONTROLLED_CAPTURE_FALLBACK_FRAME_INTERVAL: Duration = Duration::from_millis(200);
+const CONTROLLED_CAPTURE_FALLBACK_START_DELAY: Duration = Duration::from_millis(1200);
+const DISPLAY_MANAGER_OK: i32 = 0;
+const IMAGE_SUCCESS: i32 = 0;
+const PIXEL_FORMAT_RGBA_8888: i32 = 3;
+const PIXEL_FORMAT_BGRA_8888: i32 = 4;
 const INPUT_SUCCESS: i32 = 0;
 const INPUT_REPEAT_INTERCEPTOR: i32 = 4_200_001;
 
@@ -206,6 +481,1047 @@ struct AccountChallenge {
 struct ApiResponse {
     status_code: u16,
     body: Value,
+}
+
+#[derive(Default)]
+struct ControlledRuntime {
+    running: bool,
+    generation: u64,
+    server_config: Value,
+    capabilities: Value,
+    screen_config: Value,
+    audio_config: Value,
+    audio_enabled: bool,
+    incoming: VecDeque<Value>,
+    input: VecDeque<Value>,
+    clipboard: VecDeque<Value>,
+    pushed_screen_frames: u64,
+    pushed_audio_frames: u64,
+    native_capture_state: i32,
+    native_capture_error: i32,
+    native_capture_frames: u64,
+    native_capture_bytes: u64,
+    native_capture_audio_frames: u64,
+    native_capture_audio_bytes: u64,
+    native_capture_last_timestamp: i64,
+    screenshot_fallback_active: bool,
+    screenshot_fallback_frames: u64,
+    screenshot_fallback_errors: u64,
+    last_error: Option<String>,
+}
+
+fn controlled_runtime() -> &'static Mutex<ControlledRuntime> {
+    CONTROLLED_RUNTIME.get_or_init(|| Mutex::new(ControlledRuntime::default()))
+}
+
+fn controlled_parse_json(action: &str, input: &str, max_bytes: usize) -> Result<Value, String> {
+    if input.len() > max_bytes {
+        return Err(format!("{} payload exceeds {} bytes", action, max_bytes));
+    }
+    serde_json::from_str(input)
+        .map_err(|err| format!("{} payload is invalid JSON: {}", action, err))
+}
+
+fn controlled_clients_payload() -> (Vec<Value>, Vec<Value>) {
+    let raw =
+        serde_json::from_str::<Value>(&ohos::host_clients_state()).unwrap_or_else(|_| json!([]));
+    let clients = raw
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|client| {
+            json!({
+              "requestId":client.get("id").and_then(Value::as_i64).unwrap_or_default().to_string(),
+              "peerId":client.get("peer_id").and_then(Value::as_str).unwrap_or_default(),
+              "peerName":client.get("name").and_then(Value::as_str).unwrap_or_default(),
+              "authorized":client.get("authorized").and_then(Value::as_bool).unwrap_or(false)
+            })
+        })
+        .collect::<Vec<_>>();
+    let requests = clients
+        .iter()
+        .filter(|client| {
+            !client
+                .get("authorized")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    (clients, requests)
+}
+
+fn controlled_harmony_key_code_from_char(value: u64) -> Option<u64> {
+    match value {
+        value @ 48..=57 => Some(2000 + (value - 48)),
+        value @ 65..=90 => Some(2017 + (value - 65)),
+        value @ 97..=122 => Some(2017 + (value - 97)),
+        44 => Some(2043),
+        46 => Some(2044),
+        32 => Some(2050),
+        10 | 13 => Some(2054),
+        8 => Some(2055),
+        96 => Some(2056),
+        45 => Some(2057),
+        61 => Some(2058),
+        91 => Some(2059),
+        93 => Some(2060),
+        92 => Some(2061),
+        59 => Some(2062),
+        39 => Some(2063),
+        47 => Some(2064),
+        _ => None,
+    }
+}
+
+fn controlled_harmony_key_code_from_name(name: &str) -> Option<u64> {
+    if let Some(number) = name
+        .strip_prefix('F')
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if (1..=12).contains(&number) {
+            return Some(2089 + number);
+        }
+    }
+    if let Some(number) = name
+        .strip_prefix("Numpad")
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        if number <= 9 {
+            return Some(2103 + number);
+        }
+    }
+    Some(match name {
+        "UpArrow" => 2012,
+        "DownArrow" => 2013,
+        "LeftArrow" => 2014,
+        "RightArrow" => 2015,
+        "Alt" | "Option" | "Menu" => 2045,
+        "RAlt" => 2046,
+        "Shift" => 2047,
+        "RShift" => 2048,
+        "Tab" => 2049,
+        "Space" => 2050,
+        "Return" => 2054,
+        "Backspace" => 2055,
+        "Apps" => 2067,
+        "PageUp" => 2068,
+        "PageDown" => 2069,
+        "Escape" | "Cancel" => 2070,
+        "Delete" => 2071,
+        "Control" => 2072,
+        "RControl" => 2073,
+        "CapsLock" => 2074,
+        "Scroll" => 2075,
+        "Meta" => 2076,
+        "RWin" => 2077,
+        "Snapshot" | "Print" => 2079,
+        "Pause" => 2080,
+        "Home" => 2081,
+        "End" => 2082,
+        "Insert" => 2083,
+        "NumLock" => 2102,
+        "Divide" => 2113,
+        "Multiply" => 2114,
+        "Subtract" => 2115,
+        "Add" => 2116,
+        "Decimal" => 2117,
+        "NumpadEnter" => 2119,
+        "Equals" => 2058,
+        _ => return None,
+    })
+}
+
+fn controlled_harmony_key_code_from_usb_hid(value: u64) -> Option<u64> {
+    match value {
+        0x04..=0x1D => Some(2017 + value - 0x04),
+        0x1E..=0x26 => Some(2001 + value - 0x1E),
+        0x27 => Some(2000),
+        0x28 => Some(2054),
+        0x29 => Some(2070),
+        0x2A => Some(2055),
+        0x2B => Some(2049),
+        0x2C => Some(2050),
+        0x2D => Some(2057),
+        0x2E => Some(2058),
+        0x2F => Some(2059),
+        0x30 => Some(2060),
+        0x31 => Some(2061),
+        0x33 => Some(2062),
+        0x34 => Some(2063),
+        0x35 => Some(2056),
+        0x36 => Some(2043),
+        0x37 => Some(2044),
+        0x38 => Some(2064),
+        0x39 => Some(2074),
+        0x3A..=0x45 => Some(2090 + value - 0x3A),
+        0x46 => Some(2079),
+        0x47 => Some(2075),
+        0x48 => Some(2080),
+        0x49 => Some(2083),
+        0x4A => Some(2081),
+        0x4B => Some(2068),
+        0x4C => Some(2071),
+        0x4D => Some(2082),
+        0x4E => Some(2069),
+        0x4F => Some(2015),
+        0x50 => Some(2014),
+        0x51 => Some(2013),
+        0x52 => Some(2012),
+        0x53 => Some(2102),
+        0x54 => Some(2113),
+        0x55 => Some(2114),
+        0x56 => Some(2115),
+        0x57 => Some(2116),
+        0x58 => Some(2119),
+        0x59..=0x61 => Some(2104 + value - 0x59),
+        0x62 => Some(2103),
+        0x63 => Some(2117),
+        0xE0 => Some(2072),
+        0xE1 => Some(2047),
+        0xE2 => Some(2045),
+        0xE3 => Some(2076),
+        0xE4 => Some(2073),
+        0xE5 => Some(2048),
+        0xE6 => Some(2046),
+        0xE7 => Some(2077),
+        _ => None,
+    }
+}
+
+fn controlled_harmony_key_code_from_linux_evdev(value: u64) -> Option<u64> {
+    Some(match value {
+        1 => 2070,
+        2..=10 => 2001 + value - 2,
+        11 => 2000,
+        14 => 2055,
+        15 => 2049,
+        16 => 2033,
+        17 => 2039,
+        18 => 2021,
+        19 => 2034,
+        20 => 2036,
+        21 => 2041,
+        22 => 2037,
+        23 => 2025,
+        24 => 2031,
+        25 => 2032,
+        26 => 2059,
+        27 => 2060,
+        28 => 2054,
+        29 => 2072,
+        30 => 2017,
+        31 => 2035,
+        32 => 2020,
+        33 => 2022,
+        34 => 2023,
+        35 => 2024,
+        36 => 2026,
+        37 => 2027,
+        38 => 2028,
+        39 => 2062,
+        40 => 2063,
+        41 => 2056,
+        42 => 2047,
+        43 => 2061,
+        44 => 2042,
+        45 => 2040,
+        46 => 2019,
+        47 => 2038,
+        48 => 2018,
+        49 => 2030,
+        50 => 2029,
+        51 => 2043,
+        52 => 2044,
+        53 => 2064,
+        54 => 2048,
+        56 => 2045,
+        57 => 2050,
+        58 => 2074,
+        59..=68 => 2090 + value - 59,
+        87 => 2100,
+        88 => 2101,
+        97 => 2073,
+        100 => 2046,
+        102 => 2081,
+        103 => 2012,
+        104 => 2068,
+        105 => 2014,
+        106 => 2015,
+        107 => 2082,
+        108 => 2013,
+        109 => 2069,
+        110 => 2083,
+        111 => 2071,
+        125 => 2076,
+        126 => 2077,
+        _ => return None,
+    })
+}
+
+fn controlled_harmony_key_code_from_linux_x11(value: u64) -> Option<u64> {
+    controlled_harmony_key_code_from_linux_evdev(value.checked_sub(8)?)
+}
+
+fn controlled_mouse_button(rustdesk_button: i32) -> Option<i32> {
+    match rustdesk_button {
+        1 => Some(0),
+        2 => Some(2),
+        4 => Some(1),
+        8 => Some(6),
+        16 => Some(5),
+        _ => None,
+    }
+}
+
+fn controlled_pointer_coordinate(value: i64, stream_size: u64, source_size: u64) -> i64 {
+    if stream_size == 0 || source_size == 0 || stream_size == source_size {
+        return value;
+    }
+    value
+        .max(0)
+        .saturating_mul(source_size as i64)
+        .checked_div(stream_size as i64)
+        .unwrap_or(value)
+        .min(source_size.saturating_sub(1) as i64)
+}
+
+fn controlled_input_events_from_core(
+    event: &Value,
+    sequence: String,
+    display_id: u64,
+    stream_size: (u64, u64),
+    source_size: (u64, u64),
+) -> Vec<Value> {
+    match event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "pointer" => {
+            let kind = event.get("kind").and_then(Value::as_str).unwrap_or("mouse");
+            let mask = event
+                .get("mask")
+                .and_then(Value::as_i64)
+                .unwrap_or_default() as i32;
+            let event_type = mask & 0x7;
+            let x = event.get("x").and_then(Value::as_i64).unwrap_or_default();
+            let y = event.get("y").and_then(Value::as_i64).unwrap_or_default();
+            let display_x = controlled_pointer_coordinate(x, stream_size.0, source_size.0);
+            let display_y = controlled_pointer_coordinate(y, stream_size.1, source_size.1);
+            let input_type = if kind == "touch" { "touch" } else { "mouse" };
+            if input_type == "touch" {
+                let action = match mask {
+                    4 => "down",
+                    5 => "move",
+                    6 => "up",
+                    _ => return Vec::new(),
+                };
+                return vec![
+                    json!({"sequence":sequence.clone(),"eventId":sequence,"type":"touch","action":action,
+                  "displayId":display_id,"x":display_x,"y":display_y,"touchId":0}),
+                ];
+            }
+            match event_type {
+                0 => vec![
+                    json!({"sequence":sequence.clone(),"eventId":sequence,"type":"mouse","action":"move",
+                  "displayId":display_id,"x":display_x,"y":display_y}),
+                ],
+                1 | 2 => {
+                    let Some(button) = controlled_mouse_button(mask >> 3) else {
+                        return Vec::new();
+                    };
+                    vec![
+                        json!({"sequence":sequence.clone(),"eventId":sequence,"type":"mouse",
+                      "action":if event_type == 1 { "button_down" } else { "button_up" },
+                      "displayId":display_id,"x":display_x,"y":display_y,"button":button}),
+                    ]
+                }
+                3 | 4 => {
+                    let action = if event_type == 3 { "wheel" } else { "trackpad" };
+                    let mut axis_events = Vec::with_capacity(2);
+                    if y != 0 {
+                        let event_id = format!("{sequence}:v");
+                        axis_events.push(json!({"sequence":event_id.clone(),"eventId":event_id,"type":"mouse",
+                          "action":action,"displayId":display_id,"axis":0,"value":y.saturating_neg()}));
+                    }
+                    if x != 0 {
+                        let event_id = format!("{sequence}:h");
+                        axis_events.push(json!({"sequence":event_id.clone(),"eventId":event_id,"type":"mouse",
+                          "action":action,"displayId":display_id,"axis":1,"value":x.saturating_neg()}));
+                    }
+                    axis_events
+                }
+                // InputKit exposes absolute mouse movement only. Do not pretend
+                // relative type 5 events were injected successfully.
+                _ => Vec::new(),
+            }
+        }
+        "key" => {
+            let press = event.get("press").and_then(Value::as_bool).unwrap_or(false);
+            let down = event.get("down").and_then(Value::as_bool).unwrap_or(false);
+            let action = if press {
+                "press"
+            } else if down {
+                "down"
+            } else {
+                "up"
+            };
+            let mode = event
+                .get("mode")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let union_kind = event
+                .get("unionKind")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let key_code = match union_kind {
+                "controlKey" => event
+                    .get("controlKeyName")
+                    .and_then(Value::as_str)
+                    .and_then(controlled_harmony_key_code_from_name),
+                // RustDesk map/translate mode stores a platform-specific physical
+                // key code in `chr`. For HarmonyOS peers the client sends Linux
+                // evdev key codes here, not USB HID usages. Prefer the printable
+                // `seq` value for normal text keys; only use `chr` as an ASCII
+                // fallback. Treating Linux codes 30/31/32 as HID produced 9/0/Enter
+                // for A/S/D.
+                "chr" => event
+                    .get("seq")
+                    .and_then(Value::as_str)
+                    .and_then(|value| {
+                        let mut chars = value.chars();
+                        let first = chars.next()?;
+                        if chars.next().is_none() {
+                            controlled_harmony_key_code_from_char(first as u64)
+                        } else {
+                            None
+                        }
+                    })
+                    .or_else(|| {
+                        event.get("chr").and_then(Value::as_u64).and_then(|value| {
+                            // Map, Translate and Auto may all carry the physical
+                            // key produced by the sender-side map path while
+                            // retaining their configured mode value. For a
+                            // HarmonyOS peer that physical key is a Linux/X11
+                            // keycode (evdev + 8). Only Legacy mode uses `chr`
+                            // as a character value.
+                            if mode != 0 {
+                                controlled_harmony_key_code_from_linux_x11(value)
+                            } else {
+                                controlled_harmony_key_code_from_char(value)
+                            }
+                        })
+                    }),
+                "usbHid" => event
+                    .get("usbHid")
+                    .or_else(|| event.get("chr"))
+                    .and_then(Value::as_u64)
+                    .and_then(controlled_harmony_key_code_from_usb_hid),
+                "unicode" => event
+                    .get("unicode")
+                    .and_then(Value::as_u64)
+                    .and_then(controlled_harmony_key_code_from_char),
+                "seq" => event.get("seq").and_then(Value::as_str).and_then(|value| {
+                    let mut chars = value.chars();
+                    let first = chars.next()?;
+                    if chars.next().is_none() {
+                        controlled_harmony_key_code_from_char(first as u64)
+                    } else {
+                        None
+                    }
+                }),
+                _ => None,
+            };
+            let text = event
+                .get("seq")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| {
+                    event
+                        .get("unicode")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .and_then(char::from_u32)
+                        .map(|value| value.to_string())
+                });
+            vec![
+                json!({"sequence":sequence.clone(),"eventId":sequence,"type":"key","action":action,
+              "keyCode":key_code,"value":event.get("unicode"),"keyKind":event.get("unionKind"),
+              "keyName":event.get("controlKeyName"),"text":text,"mode":event.get("mode"),
+              "modeName":event.get("modeName"),"modifiers":event.get("modifiers"),
+              "modifierNames":event.get("modifierNames")}),
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod controlled_input_tests {
+    use super::*;
+
+    #[test]
+    fn wheel_preserves_both_axes_and_normalizes_direction() {
+        let events = controlled_input_events_from_core(
+            &json!({"type":"pointer","kind":"mouse","mask":3,"x":10,"y":-20}),
+            "7".to_owned(),
+            0,
+            (1920, 1280),
+            (3120, 2080),
+        );
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["axis"], json!(0));
+        assert_eq!(events[0]["value"], json!(20));
+        assert_eq!(events[1]["axis"], json!(1));
+        assert_eq!(events[1]["value"], json!(-10));
+    }
+
+    #[test]
+    fn wheel_touch_fallback_moves_against_scroll_direction() {
+        assert_eq!(
+            controlled_wheel_touch_points(0, 100, 200, 1.0),
+            [(100, 248), (100, 224), (100, 200), (100, 176), (100, 152)]
+        );
+        assert_eq!(
+            controlled_wheel_touch_points(1, 100, 200, -1.0),
+            [(52, 200), (76, 200), (100, 200), (124, 200), (148, 200)]
+        );
+    }
+
+    #[test]
+    fn button_mapping_never_falls_back_to_left() {
+        let unsupported = controlled_input_events_from_core(
+            &json!({"type":"pointer","kind":"mouse","mask":257,"x":1,"y":2}),
+            "8".to_owned(),
+            0,
+            (1920, 1280),
+            (3120, 2080),
+        );
+        assert!(unsupported.is_empty());
+
+        let back = controlled_input_events_from_core(
+            &json!({"type":"pointer","kind":"mouse","mask":65,"x":1,"y":2}),
+            "9".to_owned(),
+            0,
+            (1920, 1280),
+            (3120, 2080),
+        );
+        assert_eq!(back[0]["button"], json!(6));
+    }
+
+    #[test]
+    fn absolute_pointer_coordinates_scale_to_physical_display() {
+        let events = controlled_input_events_from_core(
+            &json!({"type":"pointer","kind":"mouse","mask":0,"x":960,"y":640}),
+            "10".to_owned(),
+            0,
+            (1920, 1280),
+            (3120, 2080),
+        );
+        assert_eq!(events[0]["x"], json!(1560));
+        assert_eq!(events[0]["y"], json!(1040));
+    }
+
+    #[test]
+    fn inputkit_side_buttons_map_to_native_global_buttons() {
+        assert_eq!(controlled_native_mouse_button(0), Some(0));
+        assert_eq!(controlled_native_mouse_button(1), Some(1));
+        assert_eq!(controlled_native_mouse_button(2), Some(2));
+        assert_eq!(controlled_native_mouse_button(5), Some(3));
+        assert_eq!(controlled_native_mouse_button(6), Some(4));
+        assert_eq!(controlled_native_mouse_button(9), None);
+    }
+
+    #[test]
+    fn non_legacy_keys_remove_linux_x11_offset_in_all_configured_modes() {
+        let cases = [
+            (38, "a", 2017),
+            (39, "s", 2035),
+            (40, "d", 2020),
+            (22, "backspace", 2055),
+        ];
+        for mode in [1, 2, 3] {
+            for (chr, seq, expected) in cases {
+                let events = controlled_input_events_from_core(
+                    &json!({
+                        "type":"key",
+                        "press":false,
+                        "down":true,
+                        "mode":mode,
+                        "unionKind":"chr",
+                        "chr":chr
+                    }),
+                    format!("key-{mode}-{seq}"),
+                    0,
+                    (1920, 1280),
+                    (3120, 2080),
+                );
+                assert_eq!(events[0]["keyCode"], json!(expected));
+            }
+        }
+    }
+}
+
+fn controlled_response(action: &str, ok: bool, state: &ControlledRuntime, extra: Value) -> String {
+    let mut response = json!({
+      "ok": ok,
+      "action": action,
+      "running": state.running,
+      "generation": state.generation,
+      "coreHostBridgeAvailable": true,
+      "nativeScreenCaptureAvailable": cfg!(target_env = "ohos"),
+      "lastError": state.last_error,
+    });
+    if let (Some(target), Some(source)) = (response.as_object_mut(), extra.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    response.to_string()
+}
+
+#[cfg(target_env = "ohos")]
+unsafe extern "C" fn controlled_capture_state_callback(
+    _capture: *mut OH_AVScreenCapture,
+    state_code: i32,
+    _user_data: *mut c_void,
+) {
+    if let Ok(mut state) = controlled_runtime().lock() {
+        state.native_capture_state = state_code;
+    }
+}
+
+#[cfg(target_env = "ohos")]
+unsafe extern "C" fn controlled_capture_error_callback(
+    _capture: *mut OH_AVScreenCapture,
+    error_code: i32,
+    _user_data: *mut c_void,
+) {
+    if let Ok(mut state) = controlled_runtime().lock() {
+        state.native_capture_error = error_code;
+        state.last_error = Some(format!("OH_AVScreenCapture error {}", error_code));
+    }
+}
+
+#[cfg(target_env = "ohos")]
+unsafe extern "C" fn controlled_capture_data_callback(
+    _capture: *mut OH_AVScreenCapture,
+    buffer: *mut OH_AVBuffer,
+    buffer_type: i32,
+    timestamp: i64,
+    _user_data: *mut c_void,
+) {
+    if buffer.is_null() || (buffer_type != 0 && buffer_type != 1) {
+        return;
+    }
+    let capacity = unsafe { OH_AVBuffer_GetCapacity(buffer) };
+    let addr = unsafe { OH_AVBuffer_GetAddr(buffer) };
+    if capacity <= 0 || addr.is_null() || capacity as usize > MAX_CONTROLLED_FRAME_BYTES {
+        return;
+    }
+    if buffer_type == 1 {
+        let audio_enabled = controlled_runtime()
+            .lock()
+            .map(|state| state.audio_enabled)
+            .unwrap_or(false);
+        if !audio_enabled {
+            return;
+        }
+        // API26 original inner-audio buffers are PCM S16LE. The native buffer is
+        // callback-owned, so convert complete stereo frames into an owned f32 LE
+        // byte vector and synchronously hand it to Core before returning.
+        let input = unsafe { slice::from_raw_parts(addr, capacity as usize) };
+        let stereo_bytes = input.len() - (input.len() % 4);
+        if stereo_bytes == 0 {
+            return;
+        }
+        let mut output = Vec::with_capacity(stereo_bytes * 2);
+        for sample in input[..stereo_bytes].chunks_exact(2) {
+            let normalized = i16::from_le_bytes([sample[0], sample[1]]) as f32 / 32768.0;
+            output.extend_from_slice(&normalized.to_le_bytes());
+        }
+        ohos::push_host_audio_f32_stereo(&output);
+        if let Ok(mut state) = controlled_runtime().lock() {
+            state.pushed_audio_frames = state.pushed_audio_frames.saturating_add(1);
+            state.native_capture_audio_frames = state.native_capture_audio_frames.saturating_add(1);
+            state.native_capture_audio_bytes = state
+                .native_capture_audio_bytes
+                .saturating_add(stereo_bytes as u64);
+        }
+        return;
+    }
+    let (width, height) = controlled_runtime()
+        .lock()
+        .ok()
+        .map(|state| {
+            (
+                state
+                    .screen_config
+                    .get("width")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                state
+                    .screen_config
+                    .get("height")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+            )
+        })
+        .unwrap_or_default();
+    let expected_bytes = width.saturating_mul(height).saturating_mul(4);
+    let forwarded = if expected_bytes > 0 && expected_bytes <= capacity as usize {
+        // OH_AVBuffer remains valid for this callback. Core synchronously copies
+        // the exact frame into its own latest-frame slot before this call returns.
+        let exact_rgba = unsafe { slice::from_raw_parts(addr, expected_bytes) };
+        ohos::push_host_screen_frame_rgba(exact_rgba, width, height)
+    } else {
+        false
+    };
+    if let Ok(mut state) = controlled_runtime().lock() {
+        state.native_capture_frames = state.native_capture_frames.saturating_add(1);
+        state.native_capture_bytes = state
+            .native_capture_bytes
+            .saturating_add(expected_bytes as u64);
+        state.native_capture_last_timestamp = timestamp;
+        if !forwarded {
+            state.last_error = Some("Core rejected native screen capture frame".to_string());
+        }
+    }
+}
+
+#[cfg(target_env = "ohos")]
+fn controlled_capture_fallback_thread() -> &'static Mutex<Option<std::thread::JoinHandle<()>>> {
+    CONTROLLED_CAPTURE_FALLBACK_THREAD.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(target_env = "ohos")]
+fn stop_controlled_capture_fallback() {
+    CONTROLLED_CAPTURE_FALLBACK_RUNNING.store(false, Ordering::Release);
+    let handle = controlled_capture_fallback_thread()
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
+    if let Ok(mut state) = controlled_runtime().lock() {
+        state.screenshot_fallback_active = false;
+    }
+}
+
+#[cfg(target_env = "ohos")]
+unsafe fn capture_display_pixelmap_rgba(
+    display_id: u32,
+) -> Result<(Vec<u8>, usize, usize), String> {
+    let mut pixelmap = std::ptr::null_mut();
+    let capture_code =
+        unsafe { OH_NativeDisplayManager_CaptureScreenPixelmap(display_id, &mut pixelmap) };
+    if capture_code != DISPLAY_MANAGER_OK || pixelmap.is_null() {
+        return Err(format!(
+            "OH_NativeDisplayManager_CaptureScreenPixelmap failed: {}",
+            capture_code
+        ));
+    }
+
+    let result = (|| {
+        let mut info = std::ptr::null_mut();
+        let create_info_code = unsafe { OH_PixelmapImageInfo_Create(&mut info) };
+        if create_info_code != IMAGE_SUCCESS || info.is_null() {
+            return Err(format!(
+                "OH_PixelmapImageInfo_Create failed: {}",
+                create_info_code
+            ));
+        }
+
+        let image_result = (|| {
+            let get_info_code = unsafe { OH_PixelmapNative_GetImageInfo(pixelmap, info) };
+            if get_info_code != IMAGE_SUCCESS {
+                return Err(format!(
+                    "OH_PixelmapNative_GetImageInfo failed: {}",
+                    get_info_code
+                ));
+            }
+            let mut width = 0u32;
+            let mut height = 0u32;
+            let mut row_stride = 0u32;
+            let mut pixel_format = 0i32;
+            for (name, code) in [
+                ("width", unsafe {
+                    OH_PixelmapImageInfo_GetWidth(info, &mut width)
+                }),
+                ("height", unsafe {
+                    OH_PixelmapImageInfo_GetHeight(info, &mut height)
+                }),
+                ("row stride", unsafe {
+                    OH_PixelmapImageInfo_GetRowStride(info, &mut row_stride)
+                }),
+                ("pixel format", unsafe {
+                    OH_PixelmapImageInfo_GetPixelFormat(info, &mut pixel_format)
+                }),
+            ] {
+                if code != IMAGE_SUCCESS {
+                    return Err(format!("Failed to read Pixelmap {}: {}", name, code));
+                }
+            }
+            if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+                return Err(format!("Invalid Pixelmap size {}x{}", width, height));
+            }
+            if pixel_format != PIXEL_FORMAT_RGBA_8888 && pixel_format != PIXEL_FORMAT_BGRA_8888 {
+                return Err(format!("Unsupported Pixelmap format {}", pixel_format));
+            }
+            let width = width as usize;
+            let height = height as usize;
+            let row_stride = row_stride as usize;
+            let row_bytes = width
+                .checked_mul(4)
+                .ok_or_else(|| "Pixelmap row size overflow".to_string())?;
+            let allocation_bytes = row_stride
+                .checked_mul(height)
+                .ok_or_else(|| "Pixelmap allocation size overflow".to_string())?;
+            if row_stride < row_bytes || allocation_bytes > MAX_CONTROLLED_FRAME_BYTES {
+                return Err(format!(
+                    "Invalid Pixelmap stride/size: stride={} bytes={} max={}",
+                    row_stride, allocation_bytes, MAX_CONTROLLED_FRAME_BYTES
+                ));
+            }
+            let mut source = vec![0u8; allocation_bytes];
+            let mut source_size = source.len();
+            let read_code = unsafe {
+                OH_PixelmapNative_ReadPixels(pixelmap, source.as_mut_ptr(), &mut source_size)
+            };
+            let required_source_bytes = row_stride
+                .checked_mul(height.saturating_sub(1))
+                .and_then(|value| value.checked_add(row_bytes))
+                .ok_or_else(|| "Pixelmap readable size overflow".to_string())?;
+            if read_code != IMAGE_SUCCESS || source_size < required_source_bytes {
+                return Err(format!(
+                    "OH_PixelmapNative_ReadPixels failed: code={} bytes={}/{}",
+                    read_code, source_size, required_source_bytes
+                ));
+            }
+
+            let tight_bytes = row_bytes
+                .checked_mul(height)
+                .ok_or_else(|| "Pixelmap frame size overflow".to_string())?;
+            let mut rgba = vec![0u8; tight_bytes];
+            for row in 0..height {
+                let source_row = &source[row * row_stride..row * row_stride + row_bytes];
+                let target_row = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
+                if pixel_format == PIXEL_FORMAT_RGBA_8888 {
+                    target_row.copy_from_slice(source_row);
+                } else {
+                    for (source_pixel, target_pixel) in source_row
+                        .chunks_exact(4)
+                        .zip(target_row.chunks_exact_mut(4))
+                    {
+                        target_pixel.copy_from_slice(&[
+                            source_pixel[2],
+                            source_pixel[1],
+                            source_pixel[0],
+                            source_pixel[3],
+                        ]);
+                    }
+                }
+            }
+            Ok((rgba, width, height))
+        })();
+        unsafe {
+            let _ = OH_PixelmapImageInfo_Release(info);
+        }
+        image_result
+    })();
+    unsafe {
+        let _ = OH_PixelmapNative_Release(pixelmap);
+    }
+    result
+}
+
+#[cfg(target_env = "ohos")]
+fn resize_controlled_rgba(
+    rgba: &[u8],
+    source_width: usize,
+    source_height: usize,
+    target_width: usize,
+    target_height: usize,
+) -> Option<Vec<u8>> {
+    let source_len = source_width.checked_mul(source_height)?.checked_mul(4)?;
+    if source_width == 0
+        || source_height == 0
+        || target_width == 0
+        || target_height == 0
+        || rgba.len() != source_len
+    {
+        return None;
+    }
+    if source_width == target_width && source_height == target_height {
+        return Some(rgba.to_vec());
+    }
+    let target_len = target_width.checked_mul(target_height)?.checked_mul(4)?;
+    if target_len > MAX_CONTROLLED_FRAME_BYTES {
+        return None;
+    }
+    let mut resized = vec![0u8; target_len];
+    for target_y in 0..target_height {
+        let source_y = target_y.saturating_mul(source_height) / target_height;
+        for target_x in 0..target_width {
+            let source_x = target_x.saturating_mul(source_width) / target_width;
+            let source_offset = (source_y * source_width + source_x) * 4;
+            let target_offset = (target_y * target_width + target_x) * 4;
+            resized[target_offset..target_offset + 4]
+                .copy_from_slice(&rgba[source_offset..source_offset + 4]);
+        }
+    }
+    Some(resized)
+}
+
+fn controlled_pixelmap_stream_size(width: usize, height: usize) -> (usize, usize) {
+    let longest = width.max(height);
+    if longest <= CONTROLLED_PIXELMAP_MAX_DIMENSION {
+        return (width, height);
+    }
+    let scaled_width = width
+        .saturating_mul(CONTROLLED_PIXELMAP_MAX_DIMENSION)
+        .checked_div(longest)
+        .unwrap_or(width)
+        .max(2)
+        & !1;
+    let scaled_height = height
+        .saturating_mul(CONTROLLED_PIXELMAP_MAX_DIMENSION)
+        .checked_div(longest)
+        .unwrap_or(height)
+        .max(2)
+        & !1;
+    (scaled_width.max(2), scaled_height.max(2))
+}
+
+#[cfg(target_env = "ohos")]
+fn start_controlled_capture_fallback_watchdog(display_id: u32) {
+    if CONTROLLED_CAPTURE_FALLBACK_RUNNING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("ohos-screen-fallback".to_owned())
+        .spawn(move || {
+            std::thread::sleep(CONTROLLED_CAPTURE_FALLBACK_START_DELAY);
+            let native_frames = controlled_runtime()
+                .lock()
+                .map(|state| state.native_capture_frames)
+                .unwrap_or_default();
+            if native_frames > 0 || !CONTROLLED_CAPTURE_FALLBACK_RUNNING.load(Ordering::Acquire) {
+                CONTROLLED_CAPTURE_FALLBACK_RUNNING.store(false, Ordering::Release);
+                return;
+            }
+            if let Ok(mut state) = controlled_runtime().lock() {
+                state.screenshot_fallback_active = true;
+            }
+            log::warn!(
+                "AVScreenCapture delivered no video frames; enabling display screenshot fallback"
+            );
+            while CONTROLLED_CAPTURE_FALLBACK_RUNNING.load(Ordering::Acquire)
+                && CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0
+            {
+                let started_at = Instant::now();
+                match unsafe { capture_display_pixelmap_rgba(display_id) } {
+                    Ok((rgba, width, height)) => {
+                        if !CONTROLLED_CAPTURE_FALLBACK_RUNNING.load(Ordering::Acquire) {
+                            break;
+                        }
+                        let (configured_width, configured_height) = ohos::host_screen_size();
+                        let (frame, frame_width, frame_height) =
+                            if configured_width > 0 && configured_height > 0 {
+                                match resize_controlled_rgba(
+                                    &rgba,
+                                    width,
+                                    height,
+                                    configured_width,
+                                    configured_height,
+                                ) {
+                                    Some(frame) => (frame, configured_width, configured_height),
+                                    None => {
+                                        if let Ok(mut state) = controlled_runtime().lock() {
+                                            state.screenshot_fallback_errors =
+                                                state.screenshot_fallback_errors.saturating_add(1);
+                                            state.last_error = Some(format!(
+                                                "Cannot normalize display frame {}x{} to {}x{}",
+                                                width, height, configured_width, configured_height
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                (rgba, width, height)
+                            };
+                        let forwarded =
+                            ohos::push_host_screen_frame_rgba(&frame, frame_width, frame_height);
+                        if let Ok(mut state) = controlled_runtime().lock() {
+                            state.screenshot_fallback_frames =
+                                state.screenshot_fallback_frames.saturating_add(1);
+                            state.native_capture_frames =
+                                state.native_capture_frames.saturating_add(1);
+                            state.native_capture_bytes = state
+                                .native_capture_bytes
+                                .saturating_add(frame.len() as u64);
+                            state.native_capture_last_timestamp = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+                                .unwrap_or_default();
+                            if !forwarded {
+                                state.last_error = Some(
+                                    "Core rejected display screenshot fallback frame".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if let Ok(mut state) = controlled_runtime().lock() {
+                            state.screenshot_fallback_errors =
+                                state.screenshot_fallback_errors.saturating_add(1);
+                            if state.screenshot_fallback_errors == 1
+                                || state.screenshot_fallback_errors % 25 == 0
+                            {
+                                state.last_error = Some(err.clone());
+                                log::error!("Display screenshot fallback failed: {}", err);
+                            }
+                        }
+                    }
+                }
+                if let Some(remaining) =
+                    CONTROLLED_CAPTURE_FALLBACK_FRAME_INTERVAL.checked_sub(started_at.elapsed())
+                {
+                    std::thread::sleep(remaining);
+                }
+            }
+            CONTROLLED_CAPTURE_FALLBACK_RUNNING.store(false, Ordering::Release);
+            if let Ok(mut state) = controlled_runtime().lock() {
+                state.screenshot_fallback_active = false;
+            }
+        });
+    match spawn_result {
+        Ok(handle) => {
+            if let Ok(mut slot) = controlled_capture_fallback_thread().lock() {
+                *slot = Some(handle);
+            }
+        }
+        Err(err) => {
+            CONTROLLED_CAPTURE_FALLBACK_RUNNING.store(false, Ordering::Release);
+            if let Ok(mut state) = controlled_runtime().lock() {
+                state.last_error = Some(format!(
+                    "Failed to start display screenshot fallback: {}",
+                    err
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(target_env = "ohos")]
+unsafe extern "C" fn controlled_input_authorize_callback(status: i32) {
+    CONTROLLED_INPUT_AUTH_STATUS.store(status, Ordering::Release);
 }
 
 #[derive(Clone, Copy, Default)]
@@ -2906,6 +4222,24 @@ pub fn session_get_enable_trusted_devices(session_id: String) -> bool {
 }
 
 #[napi]
+pub fn session_set_common(session_id: String, key: String, value: String) {
+    let _ = update_session(&session_id, "session_set_common", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        flutter_ffi::session_set_common(core_session_id, key.clone(), value.clone());
+        session.last_error = None;
+        (
+            true,
+            format!("Updated RustDesk session common value {}", key),
+        )
+    });
+}
+
+#[napi]
 pub fn session_set_custom_image_quality(session_id: String, value: i32) {
     let _ = update_session(&session_id, "session_set_custom_image_quality", |session| {
         if session.phase == "closed" {
@@ -3206,6 +4540,1181 @@ pub fn session_cancel_job(session_id: String, act_id: i32) -> String {
 pub fn transfer_next_job_id() -> u32 {
     let next = flutter_ffi::main_get_common("transfer-job-id".to_string());
     next.parse::<u32>().unwrap_or(0)
+}
+
+// API26 2-in-1 controlled-device host surface. The state machine is deliberately
+// owned by the HAR so repeated UI lifecycle calls are idempotent while Core owns
+// the actual RustDesk host lifecycle and protocol state.
+#[napi]
+pub fn controlled_server_start(config_json: String) -> String {
+    let config = match controlled_parse_json("controlled_server_start", &config_json, MAX_CONTROLLED_JSON_BYTES) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => return json!({"ok":false,"action":"controlled_server_start","message":"config must be a JSON object"}).to_string(),
+        Err(message) => return json!({"ok":false,"action":"controlled_server_start","message":message}).to_string(),
+    };
+    let audio_enabled = config
+        .get("enableAudio")
+        .or_else(|| config.get("audioEnabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.store(INPUT_MOUSE_BUTTON_NONE, Ordering::Release);
+    let started_now = ohos::start_host();
+    let mut state = controlled_runtime().lock().unwrap();
+    if !state.running || started_now {
+        state.running = true;
+        state.generation = state.generation.saturating_add(1);
+    }
+    state.server_config = config;
+    state.audio_enabled = audio_enabled;
+    state.last_error = None;
+    controlled_response(
+        "controlled_server_start",
+        ohos::host_is_started(),
+        &state,
+        json!({"idempotent":!started_now,"coreHostBridgeAvailable":true,"audioEnabled":state.audio_enabled}),
+    )
+}
+
+#[napi]
+pub fn controlled_server_stop() -> String {
+    if CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0 {
+        let _ = controlled_screen_capture_stop();
+    }
+    ohos::stop_host();
+    CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.store(INPUT_MOUSE_BUTTON_NONE, Ordering::Release);
+    let mut state = controlled_runtime().lock().unwrap();
+    state.running = false;
+    state.audio_enabled = false;
+    state.incoming.clear();
+    state.input.clear();
+    state.clipboard.clear();
+    controlled_response(
+        "controlled_server_stop",
+        true,
+        &state,
+        json!({"idempotent":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_server_get_status() -> String {
+    let mut state = controlled_runtime().lock().unwrap();
+    state.running = ohos::host_is_started();
+    let (screen_width, screen_height) = ohos::host_screen_size();
+    let (clients, _) = controlled_clients_payload();
+    controlled_response(
+        "controlled_server_get_status",
+        true,
+        &state,
+        json!({
+          "capabilities": state.capabilities,
+          "audioEnabled": state.audio_enabled,
+          "screenFramesPushed": state.pushed_screen_frames,
+          "audioFramesPushed": state.pushed_audio_frames,
+          "queueDepths": {"incoming":state.incoming.len(),"input":state.input.len(),"clipboard":state.clipboard.len()},
+          "coreHostBridgeAvailable":true,"clientCount":ohos::host_client_count(),"clients":clients,
+          "state":if state.running { "ready" } else { "disabled" },"serverRunning":state.running,
+          "myId":flutter_ffi::main_get_my_id(),"temporaryPassword":flutter_ffi::main_get_temporary_password(),
+          "screenSize":{"width":screen_width,"height":screen_height}
+        }),
+    )
+}
+
+#[napi]
+pub fn controlled_incoming_poll(limit: u32) -> String {
+    let state = controlled_runtime().lock().unwrap();
+    let (mut clients, mut requests) = controlled_clients_payload();
+    clients.truncate(limit.min(MAX_CONTROLLED_QUEUE_ITEMS as u32) as usize);
+    requests.truncate(limit.min(MAX_CONTROLLED_QUEUE_ITEMS as u32) as usize);
+    controlled_response(
+        "controlled_incoming_poll",
+        true,
+        &state,
+        json!({"clients":clients,"requests":requests,"clientCount":ohos::host_client_count()}),
+    )
+}
+
+#[napi]
+pub fn controlled_incoming_resolve(request_id: String, accepted: bool) -> String {
+    if request_id.trim().is_empty() || request_id.len() > 256 {
+        return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId must contain 1..256 bytes"}).to_string();
+    }
+    let Ok(id) = request_id.trim().parse::<i32>() else {
+        return json!({"ok":false,"action":"controlled_incoming_resolve","message":"requestId must be a numeric Core connection id"}).to_string();
+    };
+    if accepted {
+        ohos::host_authorize_client(id);
+    } else {
+        ohos::host_close_client(id);
+    }
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_incoming_resolve",
+        state.running,
+        &state,
+        json!({"requestId":request_id,"accepted":accepted,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_incoming_set_permission(
+    request_id: String,
+    permission: String,
+    enabled: bool,
+) -> String {
+    let allowed = [
+        "keyboard",
+        "clipboard",
+        "audio",
+        "file",
+        "restart",
+        "recording",
+    ];
+    if request_id.trim().is_empty() || !allowed.contains(&permission.as_str()) {
+        return json!({"ok":false,"action":"controlled_incoming_set_permission","message":"invalid requestId or permission"}).to_string();
+    }
+    let Ok(id) = request_id.trim().parse::<i32>() else {
+        return json!({"ok":false,"action":"controlled_incoming_set_permission","message":"requestId must be a numeric Core connection id"}).to_string();
+    };
+    flutter_ffi::cm_switch_permission(id, permission.clone(), enabled);
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_incoming_set_permission",
+        state.running,
+        &state,
+        json!({"requestId":request_id,"permission":permission,"enabled":enabled,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_password_get() -> String {
+    let verification_method = flutter_ffi::main_get_option("verification-method".to_string());
+    let permanent_password_set =
+        flutter_ffi::main_get_common("permanent-password-set".to_string()) == "true";
+    let local_permanent_password_set =
+        flutter_ffi::main_get_common("local-permanent-password-set".to_string()) == "true";
+    let verification_method_fixed =
+        flutter_ffi::main_is_option_fixed("verification-method".to_string()).0;
+    let permanent_password_change_disabled =
+        flutter_ffi::main_get_buildin_option("disable-change-permanent-password".to_string()).0
+            == "Y";
+    let max_password_length = flutter_ffi::main_max_encrypt_len().0;
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_password_get",
+        true,
+        &state,
+        json!({
+            "temporaryPassword":flutter_ffi::main_get_temporary_password(),
+            "verificationMethod":verification_method,
+            "permanentPasswordSet":permanent_password_set,
+            "localPermanentPasswordSet":local_permanent_password_set,
+            "verificationMethodFixed":verification_method_fixed,
+            "permanentPasswordChangeDisabled":permanent_password_change_disabled,
+            "maxPasswordLength":max_password_length,
+            "forwardedToCore":true
+        }),
+    )
+}
+
+#[napi]
+pub fn controlled_password_set_verification_method(method: String) -> String {
+    const ALLOWED: [&str; 3] = [
+        "use-temporary-password",
+        "use-permanent-password",
+        "use-both-passwords",
+    ];
+    if !ALLOWED.contains(&method.as_str()) {
+        return json!({"ok":false,"action":"controlled_password_set_verification_method","message":"invalid verification method"}).to_string();
+    }
+    if flutter_ffi::main_is_option_fixed("verification-method".to_string()).0 {
+        return json!({"ok":false,"action":"controlled_password_set_verification_method","message":"verification method is fixed by policy"}).to_string();
+    }
+    if method == "use-permanent-password"
+        && flutter_ffi::main_get_common("permanent-password-set".to_string()) != "true"
+    {
+        return json!({"ok":false,"action":"controlled_password_set_verification_method","message":"a permanent password must be configured first"}).to_string();
+    }
+    flutter_ffi::main_set_option("verification-method".to_string(), method.clone());
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_password_set_verification_method",
+        true,
+        &state,
+        json!({"verificationMethod":method,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_password_refresh() -> String {
+    flutter_ffi::main_update_temporary_password();
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_password_refresh",
+        true,
+        &state,
+        json!({"temporaryPassword":flutter_ffi::main_get_temporary_password(),"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_password_set_permanent(password: String) -> String {
+    if password.len() > MAX_CONTROLLED_PASSWORD_BYTES || password.chars().any(char::is_control) {
+        return json!({"ok":false,"action":"controlled_password_set_permanent","message":"password exceeds bounds or contains control characters"}).to_string();
+    }
+    let configured = !password.is_empty();
+    let applied = flutter_ffi::main_set_permanent_password_with_result(password);
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_password_set_permanent",
+        applied,
+        &state,
+        json!({"configured":configured && applied,"forwardedToCore":true}),
+    )
+}
+
+fn controlled_option_bool(key: &str) -> bool {
+    let value = flutter_ffi::main_get_option(key.to_string());
+    hbb_common::config::option2bool(key, &value)
+}
+
+fn controlled_option_fixed(key: &str) -> bool {
+    flutter_ffi::main_is_option_fixed(key.to_string()).0
+}
+
+#[napi]
+pub fn controlled_settings_get() -> String {
+    let approve_mode_raw = flutter_ffi::main_get_option("approve-mode".to_string());
+    let approve_mode = match approve_mode_raw.as_str() {
+        "password" => "password",
+        "click" => "click",
+        _ => "both",
+    };
+    let temporary_password_length =
+        flutter_ffi::main_get_option("temporary-password-length".to_string());
+    let temporary_password_length = match temporary_password_length.as_str() {
+        "8" => "8",
+        "10" => "10",
+        _ => "6",
+    };
+    let direct_access_port = flutter_ffi::main_get_option("direct-access-port".to_string());
+    let auto_disconnect_timeout =
+        flutter_ffi::main_get_option("auto-disconnect-timeout".to_string());
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_settings_get",
+        true,
+        &state,
+        json!({
+            "approveMode": approve_mode,
+            "temporaryPasswordLength": temporary_password_length,
+            "numericOneTimePassword": controlled_option_bool("allow-numeric-one-time-password"),
+            "enableKeyboard": controlled_option_bool("enable-keyboard"),
+            "enableClipboard": controlled_option_bool("enable-clipboard"),
+            "enableAudio": controlled_option_bool("enable-audio"),
+            "enableLanDiscovery": controlled_option_bool("enable-lan-discovery"),
+            "ipWhitelist": flutter_ffi::main_get_option("whitelist".to_string()),
+            "idWhitelist": flutter_ffi::main_get_option("id-whitelist".to_string()),
+            "directIpAccess": controlled_option_bool("direct-server"),
+            "directAccessPort": if direct_access_port.is_empty() { "21118" } else { direct_access_port.as_str() },
+            "autoDisconnect": controlled_option_bool("allow-auto-disconnect"),
+            "autoDisconnectTimeout": if auto_disconnect_timeout.is_empty() { "10" } else { auto_disconnect_timeout.as_str() },
+            "keepAwakeDuringIncomingSessions": controlled_option_bool("keep-awake-during-incoming-sessions"),
+            "allowRemoteConfigModification": controlled_option_bool("allow-remote-config-modification"),
+            "trustedDevicesEnabled": controlled_option_bool("enable-trusted-devices"),
+            "fixed": {
+                "approveMode": controlled_option_fixed("approve-mode"),
+                "temporaryPasswordLength": controlled_option_fixed("temporary-password-length"),
+                "numericOneTimePassword": controlled_option_fixed("allow-numeric-one-time-password"),
+                "enableKeyboard": controlled_option_fixed("enable-keyboard"),
+                "enableClipboard": controlled_option_fixed("enable-clipboard"),
+                "enableAudio": controlled_option_fixed("enable-audio"),
+                "enableLanDiscovery": controlled_option_fixed("enable-lan-discovery"),
+                "ipWhitelist": controlled_option_fixed("whitelist"),
+                "idWhitelist": controlled_option_fixed("id-whitelist"),
+                "directIpAccess": controlled_option_fixed("direct-server"),
+                "directAccessPort": controlled_option_fixed("direct-access-port"),
+                "autoDisconnect": controlled_option_fixed("allow-auto-disconnect"),
+                "autoDisconnectTimeout": controlled_option_fixed("auto-disconnect-timeout"),
+                "keepAwakeDuringIncomingSessions": controlled_option_fixed("keep-awake-during-incoming-sessions"),
+                "allowRemoteConfigModification": controlled_option_fixed("allow-remote-config-modification"),
+                "trustedDevicesEnabled": controlled_option_fixed("enable-trusted-devices")
+            },
+            "forwardedToCore": true
+        }),
+    )
+}
+
+#[napi]
+pub fn controlled_setting_set(key: String, value: String) -> String {
+    if key.len() > 64 || value.len() > MAX_CONTROLLED_JSON_BYTES {
+        return json!({"ok":false,"action":"controlled_setting_set","message":"setting exceeds bounds"}).to_string();
+    }
+    let option = match key.as_str() {
+        "approveMode" => "approve-mode",
+        "temporaryPasswordLength" => "temporary-password-length",
+        "numericOneTimePassword" => "allow-numeric-one-time-password",
+        "enableKeyboard" => "enable-keyboard",
+        "enableClipboard" => "enable-clipboard",
+        "enableAudio" => "enable-audio",
+        "enableLanDiscovery" => "enable-lan-discovery",
+        "ipWhitelist" => "whitelist",
+        "idWhitelist" => "id-whitelist",
+        "directIpAccess" => "direct-server",
+        "directAccessPort" => "direct-access-port",
+        "autoDisconnect" => "allow-auto-disconnect",
+        "autoDisconnectTimeout" => "auto-disconnect-timeout",
+        "keepAwakeDuringIncomingSessions" => "keep-awake-during-incoming-sessions",
+        "allowRemoteConfigModification" => "allow-remote-config-modification",
+        "trustedDevicesEnabled" => "enable-trusted-devices",
+        _ => return json!({"ok":false,"action":"controlled_setting_set","message":"unsupported setting"}).to_string(),
+    };
+    if controlled_option_fixed(option) {
+        return json!({"ok":false,"action":"controlled_setting_set","message":"setting is fixed by policy"}).to_string();
+    }
+    let stored = match key.as_str() {
+        "approveMode" => match value.as_str() {
+            "password" => "password".to_string(),
+            "click" => "click".to_string(),
+            "both" => String::new(),
+            _ => return json!({"ok":false,"action":"controlled_setting_set","message":"invalid approve mode"}).to_string(),
+        },
+        "temporaryPasswordLength" => match value.as_str() {
+            "6" | "8" | "10" => value.clone(),
+            _ => return json!({"ok":false,"action":"controlled_setting_set","message":"invalid temporary password length"}).to_string(),
+        },
+        "directAccessPort" => {
+            let Ok(port) = value.parse::<u16>() else {
+                return json!({"ok":false,"action":"controlled_setting_set","message":"invalid direct access port"}).to_string();
+            };
+            if port == 0 {
+                return json!({"ok":false,"action":"controlled_setting_set","message":"invalid direct access port"}).to_string();
+            }
+            port.to_string()
+        }
+        "autoDisconnectTimeout" => {
+            let Ok(minutes) = value.parse::<u16>() else {
+                return json!({"ok":false,"action":"controlled_setting_set","message":"invalid auto disconnect timeout"}).to_string();
+            };
+            minutes.to_string()
+        }
+        "ipWhitelist" | "idWhitelist" => value.trim().to_string(),
+        _ => match value.as_str() {
+            "true" => "Y".to_string(),
+            "false" => "N".to_string(),
+            _ => return json!({"ok":false,"action":"controlled_setting_set","message":"boolean setting must be true or false"}).to_string(),
+        },
+    };
+    flutter_ffi::main_set_option(option.to_string(), stored);
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_setting_set",
+        true,
+        &state,
+        json!({"key":key,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_two_factor_get() -> String {
+    let trusted_devices = serde_json::from_str::<Value>(&flutter_ffi::main_get_trusted_devices())
+        .unwrap_or_else(|_| json!([]));
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_two_factor_get",
+        true,
+        &state,
+        json!({
+            "enabled": flutter_ffi::main_has_valid_2fa_sync().0,
+            "trustedDevicesEnabled": controlled_option_bool("enable-trusted-devices"),
+            "trustedDevicesFixed": controlled_option_fixed("enable-trusted-devices"),
+            "trustedDevices": trusted_devices,
+            "forwardedToCore": true
+        }),
+    )
+}
+
+#[napi]
+pub fn controlled_two_factor_begin() -> String {
+    if flutter_ffi::main_has_valid_2fa_sync().0 {
+        return json!({"ok":false,"action":"controlled_two_factor_begin","message":"2FA is already enabled"}).to_string();
+    }
+    let uri = flutter_ffi::main_generate2fa();
+    if uri.is_empty() {
+        return json!({"ok":false,"action":"controlled_two_factor_begin","message":"Core failed to generate 2FA secret"}).to_string();
+    }
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_two_factor_begin",
+        true,
+        &state,
+        json!({"uri":uri,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_two_factor_verify(code: String) -> String {
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return json!({"ok":false,"action":"controlled_two_factor_verify","message":"verification code must contain six digits"}).to_string();
+    }
+    let verified = flutter_ffi::main_verify2fa(code);
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_two_factor_verify",
+        verified,
+        &state,
+        json!({"enabled":flutter_ffi::main_has_valid_2fa_sync().0,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_two_factor_disable() -> String {
+    flutter_ffi::main_disable2fa();
+    let enabled = flutter_ffi::main_has_valid_2fa_sync().0;
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_two_factor_disable",
+        !enabled,
+        &state,
+        json!({"enabled":enabled,"trustedDevicesCleared":true,"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_two_factor_remove_trusted_devices(hwids_json: String) -> String {
+    let hwids = match controlled_parse_json(
+        "controlled_two_factor_remove_trusted_devices",
+        &hwids_json,
+        MAX_CONTROLLED_JSON_BYTES,
+    ) {
+        Ok(value) if value.is_array() => value,
+        Ok(_) => return json!({"ok":false,"action":"controlled_two_factor_remove_trusted_devices","message":"hwids must be a JSON array"}).to_string(),
+        Err(message) => return json!({"ok":false,"action":"controlled_two_factor_remove_trusted_devices","message":message}).to_string(),
+    };
+    flutter_ffi::main_remove_trusted_devices(hwids.to_string());
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_two_factor_remove_trusted_devices",
+        true,
+        &state,
+        json!({"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_two_factor_clear_trusted_devices() -> String {
+    flutter_ffi::main_clear_trusted_devices();
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_two_factor_clear_trusted_devices",
+        true,
+        &state,
+        json!({"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_screen_configure(config_json: String) -> String {
+    let config = match controlled_parse_json("controlled_screen_configure", &config_json, MAX_CONTROLLED_JSON_BYTES) { Ok(v) if v.is_object() => v, Ok(_) => return json!({"ok":false,"action":"controlled_screen_configure","message":"config must be a JSON object"}).to_string(), Err(m) => return json!({"ok":false,"action":"controlled_screen_configure","message":m}).to_string() };
+    let width = config.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let height = config.get("height").and_then(Value::as_u64).unwrap_or(0);
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return json!({"ok":false,"action":"controlled_screen_configure","message":"width and height must be within 1..16384"}).to_string();
+    }
+    // The API26 emulator's only reliable backend is the CPU PixelMap path. Keep
+    // its VP8 stream bounded so desktop decoders receive frames promptly while
+    // retaining the source aspect ratio. The full display is still sampled;
+    // only the frame handed to Core is normalized.
+    let (stream_width, stream_height) =
+        controlled_pixelmap_stream_size(width as usize, height as usize);
+    let previous = ohos::host_screen_size();
+    let forwarded = ohos::configure_host_screen(stream_width, stream_height);
+    let current = ohos::host_screen_size();
+    let changed = forwarded && previous != current;
+    let mut state = controlled_runtime().lock().unwrap();
+    if forwarded {
+        let mut normalized_config = config;
+        normalized_config["sourceWidth"] = json!(width);
+        normalized_config["sourceHeight"] = json!(height);
+        normalized_config["width"] = json!(stream_width);
+        normalized_config["height"] = json!(stream_height);
+        state.screen_config = normalized_config;
+    } else {
+        state.last_error = Some("Core rejected controlled-host screen geometry".to_string());
+    }
+    controlled_response(
+        "controlled_screen_configure",
+        forwarded,
+        &state,
+        json!({"nativeCaptureStartStopAvailable":cfg!(target_env = "ohos"),"changed":changed,"forwardedToCore":forwarded,"width":current.0,"height":current.1,"sourceWidth":width,"sourceHeight":height}),
+    )
+}
+
+#[napi]
+pub fn controlled_screen_push_frame(
+    frame: napi_ohos::bindgen_prelude::Uint8Array,
+    metadata_json: String,
+) -> String {
+    if frame.len() > MAX_CONTROLLED_FRAME_BYTES {
+        return json!({"ok":false,"action":"controlled_screen_push_frame","message":"frame exceeds 32 MiB"}).to_string();
+    }
+    let metadata = match controlled_parse_json(
+        "controlled_screen_push_frame",
+        &metadata_json,
+        MAX_CONTROLLED_JSON_BYTES,
+    ) {
+        Ok(value) => value,
+        Err(message) => {
+            return json!({"ok":false,"action":"controlled_screen_push_frame","message":message})
+                .to_string()
+        }
+    };
+    let width = metadata.get("width").and_then(Value::as_u64).unwrap_or(0) as usize;
+    let height = metadata.get("height").and_then(Value::as_u64).unwrap_or(0) as usize;
+    if width == 0 || height == 0 || frame.len() < width.saturating_mul(height).saturating_mul(4) {
+        return json!({"ok":false,"action":"controlled_screen_push_frame","message":"metadata width/height or RGBA byte length is invalid"}).to_string();
+    }
+    let mut state = controlled_runtime().lock().unwrap();
+    if !state.running {
+        return controlled_response(
+            "controlled_screen_push_frame",
+            false,
+            &state,
+            json!({"message":"server is stopped"}),
+        );
+    }
+    let forwarded = ohos::push_host_screen_frame_rgba(frame.as_ref(), width, height);
+    if forwarded {
+        state.pushed_screen_frames = state.pushed_screen_frames.saturating_add(1);
+    }
+    controlled_response(
+        "controlled_screen_push_frame",
+        forwarded,
+        &state,
+        json!({"bytes":frame.len(),"width":width,"height":height,"forwardedToCore":forwarded}),
+    )
+}
+
+#[napi]
+pub fn controlled_input_poll(limit: u32) -> String {
+    let state = controlled_runtime().lock().unwrap();
+    let display_id = state
+        .screen_config
+        .get("displayId")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let stream_size = (
+        state
+            .screen_config
+            .get("width")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        state
+            .screen_config
+            .get("height")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    );
+    let source_size = (
+        state
+            .screen_config
+            .get("sourceWidth")
+            .and_then(Value::as_u64)
+            .unwrap_or(stream_size.0),
+        state
+            .screen_config
+            .get("sourceHeight")
+            .and_then(Value::as_u64)
+            .unwrap_or(stream_size.1),
+    );
+    let mut events = Vec::new();
+    for _ in 0..limit.min(MAX_CONTROLLED_QUEUE_ITEMS as u32) {
+        let Some(event_json) = ohos::poll_host_input_event_json() else {
+            break;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(&event_json) else {
+            continue;
+        };
+        let sequence = CONTROLLED_INPUT_SEQUENCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        events.extend(controlled_input_events_from_core(
+            &event,
+            sequence,
+            display_id,
+            stream_size,
+            source_size,
+        ));
+    }
+    controlled_response(
+        "controlled_input_poll",
+        true,
+        &state,
+        json!({"events":events,"forwardedFromCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_input_ack(event_id: String, success: bool) -> String {
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_input_ack",
+        state.running && !event_id.trim().is_empty() && event_id.len() <= 256,
+        &state,
+        json!({"eventId":event_id,"success":success,"ackRequiredByCore":false}),
+    )
+}
+
+fn controlled_native_mouse_button(button: i64) -> Option<i32> {
+    match button {
+        0 => Some(0),
+        1 => Some(1),
+        2 => Some(2),
+        // InputKit uses 5/6 for forward/back, while the native input API uses 3/4.
+        5 => Some(3),
+        6 => Some(4),
+        _ => None,
+    }
+}
+
+fn controlled_wheel_touch_points(axis: i32, x: i32, y: i32, value: f32) -> [(i32, i32); 5] {
+    // API 26 currently accepts simulated mouse-axis events but routes them
+    // with an unusable synthetic axis id, so ArkUI/Web components receive no
+    // displacement. Model one discrete wheel step as a short touch pan at the
+    // cursor instead; both native Scroll and Web components consume this path.
+    let distance = (value.abs().clamp(1.0, 4.0) * 96.0).round() as i32;
+    let direction = if value > 0.0 { -1 } else { 1 };
+    let start_offset = -(direction * (distance / 2));
+    let end_offset = direction * (distance / 2);
+    let offsets = [
+        start_offset,
+        start_offset / 2,
+        0,
+        end_offset / 2,
+        end_offset,
+    ];
+    offsets.map(|offset| {
+        if axis == 0 {
+            (x.max(0), y.saturating_add(offset).max(0))
+        } else {
+            (x.saturating_add(offset).max(0), y.max(0))
+        }
+    })
+}
+
+#[cfg(target_env = "ohos")]
+unsafe fn controlled_mouse_action_time() -> i64 {
+    const CLOCK_MONOTONIC: i32 = 1;
+    let mut time = OhosTimespec::default();
+    // InputKit's PointerEvent actionTime uses monotonic microseconds, matching
+    // multimodalinput_input::GetSysClockTime(). Milliseconds are treated as
+    // stale events after they reach the input service.
+    let now = if clock_gettime(CLOCK_MONOTONIC, &mut time) == 0 {
+        time.tv_sec
+            .saturating_mul(1_000_000)
+            .saturating_add(time.tv_nsec / 1_000)
+    } else {
+        0
+    };
+    let mut previous = CONTROLLED_GLOBAL_MOUSE_ACTION_TIME.load(Ordering::Acquire);
+    loop {
+        let next = now.max(previous.saturating_add(1));
+        match CONTROLLED_GLOBAL_MOUSE_ACTION_TIME.compare_exchange_weak(
+            previous,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
+    }
+}
+
+#[cfg(target_env = "ohos")]
+unsafe fn controlled_prepare_global_mouse_event(
+    mouse_event: *mut InputMouseEvent,
+    display_id: i32,
+    x: i32,
+    y: i32,
+    button: i32,
+) {
+    OH_Input_SetMouseEventDisplayId(mouse_event, display_id);
+    OH_Input_SetMouseEventDisplayX(mouse_event, x);
+    OH_Input_SetMouseEventDisplayY(mouse_event, y);
+    OH_Input_SetMouseEventGlobalX(mouse_event, x);
+    OH_Input_SetMouseEventGlobalY(mouse_event, y);
+    OH_Input_SetMouseEventButton(mouse_event, button);
+    OH_Input_SetMouseEventActionTime(mouse_event, controlled_mouse_action_time());
+}
+
+#[napi]
+pub fn controlled_input_inject_mouse_global(event_json: String) -> String {
+    let event = match controlled_parse_json(
+        "controlled_input_inject_mouse_global",
+        &event_json,
+        MAX_CONTROLLED_JSON_BYTES,
+    ) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => {
+            return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"event must be a JSON object"}).to_string()
+        }
+        Err(message) => {
+            return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":message}).to_string()
+        }
+    };
+    if event.get("type").and_then(Value::as_str) != Some("mouse") {
+        return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"only mouse events are supported"}).to_string();
+    }
+
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        let action = event
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let display_id = event
+            .get("displayId")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .unwrap_or(0);
+        let supplied_x = event
+            .get("x")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        let supplied_y = event
+            .get("y")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok());
+        if let Some(x) = supplied_x {
+            CONTROLLED_GLOBAL_MOUSE_X.store(x, Ordering::Release);
+        }
+        if let Some(y) = supplied_y {
+            CONTROLLED_GLOBAL_MOUSE_Y.store(y, Ordering::Release);
+        }
+        let x = supplied_x.unwrap_or_else(|| CONTROLLED_GLOBAL_MOUSE_X.load(Ordering::Acquire));
+        let y = supplied_y.unwrap_or_else(|| CONTROLLED_GLOBAL_MOUSE_Y.load(Ordering::Acquire));
+
+        let mut mouse_event = OH_Input_CreateMouseEvent();
+        if mouse_event.is_null() {
+            return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"failed to create native mouse event"}).to_string();
+        }
+
+        let result = match action {
+            "move" => {
+                let pressed_button = CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.load(Ordering::Acquire);
+                controlled_prepare_global_mouse_event(
+                    mouse_event,
+                    display_id,
+                    x,
+                    y,
+                    pressed_button,
+                );
+                OH_Input_SetMouseEventAction(mouse_event, INPUT_MOUSE_ACTION_MOVE);
+                vec![OH_Input_InjectMouseEventGlobal(mouse_event)]
+            }
+            "button_down" | "down" | "button_up" | "up" => {
+                let Some(button) = event
+                    .get("button")
+                    .and_then(Value::as_i64)
+                    .and_then(controlled_native_mouse_button)
+                else {
+                    OH_Input_DestroyMouseEvent(&mut mouse_event);
+                    return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"unsupported mouse button"}).to_string();
+                };
+                controlled_prepare_global_mouse_event(mouse_event, display_id, x, y, button);
+                OH_Input_SetMouseEventAction(
+                    mouse_event,
+                    if action == "button_down" || action == "down" {
+                        INPUT_MOUSE_ACTION_BUTTON_DOWN
+                    } else {
+                        INPUT_MOUSE_ACTION_BUTTON_UP
+                    },
+                );
+                let code = OH_Input_InjectMouseEventGlobal(mouse_event);
+                if code == INPUT_SUCCESS {
+                    if action == "button_down" || action == "down" {
+                        CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON.store(button, Ordering::Release);
+                    } else {
+                        CONTROLLED_GLOBAL_MOUSE_PRESSED_BUTTON
+                            .store(INPUT_MOUSE_BUTTON_NONE, Ordering::Release);
+                    }
+                }
+                vec![code]
+            }
+            "axis" | "wheel" | "trackpad" => {
+                let axis = event
+                    .get("axis")
+                    .and_then(Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .unwrap_or(0);
+                if axis != 0 && axis != 1 {
+                    OH_Input_DestroyMouseEvent(&mut mouse_event);
+                    return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"unsupported mouse axis"}).to_string();
+                }
+                let value = event
+                    .get("value")
+                    .and_then(Value::as_f64)
+                    .unwrap_or_default() as f32;
+                if value == 0.0 {
+                    OH_Input_DestroyMouseEvent(&mut mouse_event);
+                    return json!({"ok":true,"action":"controlled_input_inject_mouse_global","nativeCodes":[],"ignoredZeroAxis":true}).to_string();
+                }
+                let mut touch_event = OH_Input_CreateTouchEvent();
+                if touch_event.is_null() {
+                    OH_Input_DestroyMouseEvent(&mut mouse_event);
+                    return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"failed to create native touch event for wheel"}).to_string();
+                }
+                OH_Input_SetTouchEventFingerId(touch_event, 0);
+                OH_Input_SetTouchEventDisplayId(touch_event, display_id);
+                let points = controlled_wheel_touch_points(axis, x, y, value);
+                let mut codes = Vec::with_capacity(points.len());
+                for (index, (touch_x, touch_y)) in points.into_iter().enumerate() {
+                    if index > 0 {
+                        std::thread::sleep(Duration::from_millis(16));
+                    }
+                    OH_Input_SetTouchEventDisplayX(touch_event, touch_x);
+                    OH_Input_SetTouchEventDisplayY(touch_event, touch_y);
+                    OH_Input_SetTouchEventGlobalX(touch_event, touch_x);
+                    OH_Input_SetTouchEventGlobalY(touch_event, touch_y);
+                    OH_Input_SetTouchEventActionTime(touch_event, controlled_mouse_action_time());
+                    OH_Input_SetTouchEventAction(
+                        touch_event,
+                        if index == 0 {
+                            INPUT_TOUCH_ACTION_DOWN
+                        } else if index + 1 == points.len() {
+                            INPUT_TOUCH_ACTION_UP
+                        } else {
+                            INPUT_TOUCH_ACTION_MOVE
+                        },
+                    );
+                    codes.push(OH_Input_InjectTouchEventGlobal(touch_event));
+                }
+                OH_Input_DestroyTouchEvent(&mut touch_event);
+                codes
+            }
+            _ => {
+                OH_Input_DestroyMouseEvent(&mut mouse_event);
+                return json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"unsupported mouse action"}).to_string();
+            }
+        };
+        OH_Input_DestroyMouseEvent(&mut mouse_event);
+        let ok = result.iter().all(|code| *code == 0);
+        return json!({
+          "ok":ok,
+          "action":"controlled_input_inject_mouse_global",
+          "nativeCodes":result,
+          "globalX":x,
+          "globalY":y,
+          "globalInjection":true
+        })
+        .to_string();
+    }
+
+    #[cfg(not(target_env = "ohos"))]
+    json!({"ok":false,"action":"controlled_input_inject_mouse_global","message":"global mouse injection is only available on OHOS"}).to_string()
+}
+
+#[napi]
+pub fn controlled_clipboard_push(content_json: String) -> String {
+    let content = match controlled_parse_json(
+        "controlled_clipboard_push",
+        &content_json,
+        MAX_CONTROLLED_CLIPBOARD_BYTES,
+    ) {
+        Ok(v) => v,
+        Err(m) => {
+            return json!({"ok":false,"action":"controlled_clipboard_push","message":m}).to_string()
+        }
+    };
+    let Some(text) = content.get("text").and_then(Value::as_str) else {
+        return json!({"ok":false,"action":"controlled_clipboard_push","message":"content.text must be a string"}).to_string();
+    };
+    let clipboards = MultiClipboards {
+        clipboards: vec![Clipboard {
+            content: text.as_bytes().to_vec().into(),
+            format: ClipboardFormat::Text.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    ohos::update_clipboards(false, clipboards);
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_clipboard_push",
+        state.running,
+        &state,
+        json!({"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_clipboard_poll(limit: u32) -> String {
+    let state = controlled_runtime().lock().unwrap();
+    let mut events = Vec::new();
+    if limit > 0 {
+        if let Some(clipboards) = ohos::take_host_received_clipboards() {
+            for clipboard in clipboards
+                .clipboards
+                .into_iter()
+                .take(limit.min(MAX_CONTROLLED_QUEUE_ITEMS as u32) as usize)
+            {
+                events.push(json!({"format":clipboard.format.value(),"text":String::from_utf8_lossy(&clipboard.content).to_string(),"bytes":clipboard.content.len()}));
+            }
+        }
+    }
+    controlled_response(
+        "controlled_clipboard_poll",
+        true,
+        &state,
+        json!({"events":events,"forwardedFromCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_audio_configure(config_json: String) -> String {
+    let config = match controlled_parse_json("controlled_audio_configure", &config_json, MAX_CONTROLLED_JSON_BYTES) { Ok(v) if v.is_object() => v, Ok(_) => return json!({"ok":false,"action":"controlled_audio_configure","message":"config must be a JSON object"}).to_string(), Err(m) => return json!({"ok":false,"action":"controlled_audio_configure","message":m}).to_string() };
+    let mut state = controlled_runtime().lock().unwrap();
+    state.audio_config = config;
+    controlled_response("controlled_audio_configure", true, &state, json!({}))
+}
+
+#[napi]
+pub fn controlled_audio_push_frame(
+    frame: napi_ohos::bindgen_prelude::Uint8Array,
+    metadata_json: String,
+) -> String {
+    if frame.len() > MAX_CONTROLLED_FRAME_BYTES {
+        return json!({"ok":false,"action":"controlled_audio_push_frame","message":"frame exceeds 32 MiB"}).to_string();
+    }
+    if let Err(m) = controlled_parse_json(
+        "controlled_audio_push_frame",
+        &metadata_json,
+        MAX_CONTROLLED_JSON_BYTES,
+    ) {
+        return json!({"ok":false,"action":"controlled_audio_push_frame","message":m}).to_string();
+    }
+    let mut state = controlled_runtime().lock().unwrap();
+    if !state.running || !state.audio_enabled {
+        return controlled_response(
+            "controlled_audio_push_frame",
+            false,
+            &state,
+            json!({"message":"server or audio is disabled"}),
+        );
+    }
+    ohos::push_host_audio_f32_stereo(frame.as_ref());
+    state.pushed_audio_frames = state.pushed_audio_frames.saturating_add(1);
+    controlled_response(
+        "controlled_audio_push_frame",
+        true,
+        &state,
+        json!({"bytes":frame.len(),"forwardedToCore":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_audio_set_enabled(enabled: bool) -> String {
+    let mut state = controlled_runtime().lock().unwrap();
+    state.audio_enabled = enabled && state.running;
+    controlled_response(
+        "controlled_audio_set_enabled",
+        enabled == state.audio_enabled,
+        &state,
+        json!({"enabled":state.audio_enabled,"coreConsumesFramesWhenEnabled":true}),
+    )
+}
+
+#[napi]
+pub fn controlled_device_set_capabilities(capabilities_json: String) -> String {
+    let capabilities = match controlled_parse_json("controlled_device_set_capabilities", &capabilities_json, MAX_CONTROLLED_JSON_BYTES) { Ok(v) if v.is_object() => v, Ok(_) => return json!({"ok":false,"action":"controlled_device_set_capabilities","message":"capabilities must be a JSON object"}).to_string(), Err(m) => return json!({"ok":false,"action":"controlled_device_set_capabilities","message":m}).to_string() };
+    let mut state = controlled_runtime().lock().unwrap();
+    state.capabilities = capabilities;
+    controlled_response(
+        "controlled_device_set_capabilities",
+        true,
+        &state,
+        json!({"forwardedToCore":false}),
+    )
+}
+
+#[napi]
+pub fn controlled_device_get_capabilities() -> String {
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_device_get_capabilities",
+        true,
+        &state,
+        json!({"capabilities":state.capabilities,"nativeScreenCapture":{"available":cfg!(target_env = "ohos"),"framesForwardedToCore":true},"inputDialogAuthorization":{"available":cfg!(target_env = "ohos"),"independentOfControlDevice":true}}),
+    )
+}
+
+#[napi]
+pub fn controlled_screen_capture_start(config_json: String) -> String {
+    let mut config = match controlled_parse_json("controlled_screen_capture_start", &config_json, MAX_CONTROLLED_JSON_BYTES) {
+        Ok(value) if value.is_object() => value,
+        Ok(_) => return json!({"ok":false,"action":"controlled_screen_capture_start","message":"config must be a JSON object"}).to_string(),
+        Err(message) => return json!({"ok":false,"action":"controlled_screen_capture_start","message":message}).to_string(),
+    };
+    let width = config.get("width").and_then(Value::as_u64).unwrap_or(0);
+    let height = config.get("height").and_then(Value::as_u64).unwrap_or(0);
+    let display_id = config.get("displayId").and_then(Value::as_u64).unwrap_or(0);
+    let frame_rate = config
+        .get("frameRate")
+        .and_then(Value::as_u64)
+        .unwrap_or(30);
+    if width == 0
+        || height == 0
+        || width > 16_384
+        || height > 16_384
+        || display_id > u32::MAX as u64
+        || frame_rate == 0
+        || frame_rate > 240
+    {
+        return json!({"ok":false,"action":"controlled_screen_capture_start","message":"width/height must be 1..16384 and frameRate 1..240"}).to_string();
+    }
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        let existing = CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire);
+        if existing != 0 {
+            let state = controlled_runtime().lock().unwrap();
+            return controlled_response(
+                "controlled_screen_capture_start",
+                true,
+                &state,
+                json!({"idempotent":true,"captureRequested":true}),
+            );
+        }
+        // API26 Beta1's AVScreenCapture maps emulator DMA buffers through
+        // ExpressMmap. That mapping fails and, while the capture session stays
+        // active, the display manager privacy path returns a full black frame
+        // even to the CPU PixelMap fallback. Use the permission-mediated
+        // display PixelMap backend directly on this API26 controlled-host path.
+        CONTROLLED_CAPTURE_HANDLE.store(CONTROLLED_CAPTURE_PIXELMAP_HANDLE, Ordering::Release);
+        let configured_size = ohos::host_screen_size();
+        if configured_size.0 > 0 && configured_size.1 > 0 {
+            config["sourceWidth"] = json!(width);
+            config["sourceHeight"] = json!(height);
+            config["width"] = json!(configured_size.0);
+            config["height"] = json!(configured_size.1);
+        }
+        {
+            let mut state = controlled_runtime().lock().unwrap();
+            state.native_capture_error = 0;
+            state.native_capture_frames = 0;
+            state.native_capture_bytes = 0;
+            state.native_capture_audio_frames = 0;
+            state.native_capture_audio_bytes = 0;
+            state.screenshot_fallback_active = false;
+            state.screenshot_fallback_frames = 0;
+            state.screenshot_fallback_errors = 0;
+            state.screen_config = config;
+        }
+        start_controlled_capture_fallback_watchdog(display_id as u32);
+        let state = controlled_runtime().lock().unwrap();
+        return controlled_response(
+            "controlled_screen_capture_start",
+            true,
+            &state,
+            json!({"captureRequested":true,"privacyDialogExpected":false,"framesForwardedToCore":true,"innerAudioCaptureConfigured":false,"audioEnabled":false,"captureMode":"display_pixelmap"}),
+        );
+    }
+    #[cfg(not(target_env = "ohos"))]
+    json!({"ok":false,"action":"controlled_screen_capture_start","message":"OH_AVScreenCapture is only available on OHOS"}).to_string()
+}
+
+#[napi]
+pub fn controlled_screen_capture_stop() -> String {
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        let handle = CONTROLLED_CAPTURE_HANDLE.swap(0, Ordering::AcqRel);
+        stop_controlled_capture_fallback();
+        if handle == 0 {
+            let state = controlled_runtime().lock().unwrap();
+            return controlled_response(
+                "controlled_screen_capture_stop",
+                true,
+                &state,
+                json!({"idempotent":true}),
+            );
+        }
+        let (stop, release) = if handle == CONTROLLED_CAPTURE_PIXELMAP_HANDLE {
+            (0, 0)
+        } else {
+            let capture = handle as usize as *mut OH_AVScreenCapture;
+            (
+                OH_AVScreenCapture_StopScreenCapture(capture),
+                OH_AVScreenCapture_Release(capture),
+            )
+        };
+        let mut state = controlled_runtime().lock().unwrap();
+        state.native_capture_state = -1;
+        return controlled_response(
+            "controlled_screen_capture_stop",
+            stop == 0 && release == 0,
+            &state,
+            json!({"stopCode":stop,"releaseCode":release}),
+        );
+    }
+    #[cfg(not(target_env = "ohos"))]
+    json!({"ok":true,"action":"controlled_screen_capture_stop","idempotent":true}).to_string()
+}
+
+#[napi]
+pub fn controlled_screen_capture_get_status() -> String {
+    let state = controlled_runtime().lock().unwrap();
+    controlled_response(
+        "controlled_screen_capture_get_status",
+        true,
+        &state,
+        json!({
+          "available": cfg!(target_env = "ohos"), "active": CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != 0,
+          "nativeStateCode":state.native_capture_state,"nativeErrorCode":state.native_capture_error,
+          "framesObserved":state.native_capture_frames,"bytesObserved":state.native_capture_bytes,
+          "audioFramesObserved":state.native_capture_audio_frames,"audioPcmBytesObserved":state.native_capture_audio_bytes,
+          "audioFramesForwarded":state.pushed_audio_frames,"audioEnabled":state.audio_enabled,
+          "lastTimestampNs":state.native_capture_last_timestamp,"framesForwardedToCore":true,
+          "innerAudioCaptureConfigured":CONTROLLED_CAPTURE_HANDLE.load(Ordering::Acquire) != CONTROLLED_CAPTURE_PIXELMAP_HANDLE,
+          "captureMode":if state.screenshot_fallback_active { "display_pixelmap_fallback" } else { "avscreen" },
+          "screenshotFallbackFrames":state.screenshot_fallback_frames,"screenshotFallbackErrors":state.screenshot_fallback_errors
+        }),
+    )
+}
+
+#[napi]
+pub fn controlled_input_request_authorization() -> String {
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        let result = OH_Input_RequestInjection(controlled_input_authorize_callback);
+        return json!({"ok":result == 0 || result == 3900005 || result == 3900007,"action":"controlled_input_request_authorization","nativeCode":result,"dialogAuthorizationIndependentOfControlDevice":true}).to_string();
+    }
+    #[cfg(not(target_env = "ohos"))]
+    json!({"ok":false,"action":"controlled_input_request_authorization","message":"input authorization is only available on OHOS"}).to_string()
+}
+
+#[napi]
+pub fn controlled_input_get_authorization_status() -> String {
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        let mut status = -1;
+        let result = OH_Input_QueryAuthorizedStatus(&mut status);
+        if result == 0 {
+            CONTROLLED_INPUT_AUTH_STATUS.store(status, Ordering::Release);
+        }
+        return json!({"ok":result == 0,"action":"controlled_input_get_authorization_status","nativeCode":result,"status":CONTROLLED_INPUT_AUTH_STATUS.load(Ordering::Acquire),"dialogAuthorizationOnly":true}).to_string();
+    }
+    #[cfg(not(target_env = "ohos"))]
+    json!({"ok":false,"action":"controlled_input_get_authorization_status","status":-1}).to_string()
+}
+
+#[napi]
+pub fn controlled_input_cancel_authorization() -> String {
+    #[cfg(target_env = "ohos")]
+    unsafe {
+        OH_Input_CancelInjection();
+        CONTROLLED_INPUT_AUTH_STATUS.store(-1, Ordering::Release);
+    }
+    json!({"ok":true,"action":"controlled_input_cancel_authorization"}).to_string()
 }
 
 #[napi]
