@@ -294,7 +294,7 @@ export declare function runtimeProbePeerDirectStates(targetsJson: string): Promi
 
 export declare function runtimeRemoveRecentPeer(peerId: string): string
 
-export declare function runtimeScanLanPeers(): string
+export declare function runtimeScanLanPeers(): Promise<string>
 
 export declare function runtimeSetFavorite(peerId: string, favorite: boolean): string
 

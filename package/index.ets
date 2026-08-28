@@ -571,7 +571,7 @@ export function runtimeRemoveRecentPeer(peerId: string): string {
   return native.runtimeRemoveRecentPeer(peerId);
 }
 
-export function runtimeScanLanPeers(): string {
+export function runtimeScanLanPeers(): Promise<string> {
   return native.runtimeScanLanPeers();
 }
 
