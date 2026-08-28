@@ -36,210 +36,6 @@ export declare function inputInterceptorStart(): string
 
 export declare function inputInterceptorStop(): string
 
-export declare function mainAudioSupportLoopback(): boolean
-
-export declare function mainCheckHwcodec(): void
-
-export declare function mainCheckMouseTime(): void
-
-export declare function mainCheckSuperUserPermission(): boolean
-
-export declare function mainClearTrustedDevices(): void
-
-export declare function mainCreateShortcut(id: string): void
-
-export declare function mainCurrentIsWayland(): boolean
-
-export declare function mainDefaultPrivacyModeImpl(): string
-
-export declare function mainForgetPassword(id: string): void
-
-export declare function mainGenerate2Fa(): string
-
-export declare function mainGetApiServer(): string
-
-export declare function mainGetAppName(): string
-
-export declare function mainGetAsyncStatus(): string
-
-export declare function mainGetBuildDate(): string
-
-export declare function mainGetBuildinOption(key: string): string
-
-export declare function mainGetCommon(key: string): string
-
-export declare function mainGetCommonSync(key: string): string
-
-export declare function mainGetConnectStatus(): string
-
-export declare function mainGetDisplays(): string
-
-export declare function mainGetError(): string
-
-export declare function mainGetFav(): Array<string>
-
-export declare function mainGetFingerprint(): string
-
-export declare function mainGetHardOption(key: string): string
-
-export declare function mainGetHomeDir(): string
-
-export declare function mainGetLanPeers(): string
-
-export declare function mainGetLangs(): string
-
-export declare function mainGetLastRemoteId(): string
-
-export declare function mainGetLicense(): string
-
-export declare function mainGetLocalOption(key: string): string
-
-export declare function mainGetLoginDeviceInfo(): string
-
-export declare function mainGetMainDisplay(): string
-
-export declare function mainGetMouseTime(): number
-
-export declare function mainGetMyId(): string
-
-export declare function mainGetNewStoredPeers(): string
-
-export declare function mainGetNewVersion(): string
-
-export declare function mainGetOption(key: string): string
-
-export declare function mainGetOptions(): string
-
-export declare function mainGetPeerFlutterOptionSync(id: string, key: string): string
-
-export declare function mainGetPeerOption(id: string, key: string): string
-
-export declare function mainGetPeerOptionSync(id: string, key: string): string
-
-export declare function mainGetPeerSync(id: string): string
-
-export declare function mainGetPrinterNames(): string
-
-export declare function mainGetProxyStatus(): boolean
-
-export declare function mainGetSocks(): Array<string>
-
-export declare function mainGetSoftwareUpdateUrl(): void
-
-export declare function mainGetSoundInputs(): Array<string>
-
-export declare function mainGetTemporaryPassword(): string
-
-export declare function mainGetTrustedDevices(): string
-
-export declare function mainGetUnlockPin(): string
-
-export declare function mainGetUseTextureRender(): boolean
-
-export declare function mainGetUserDefaultOption(key: string): string
-
-export declare function mainGetUuid(): string
-
-export declare function mainGetVersion(): string
-
-export declare function mainGotoInstall(): boolean
-
-export declare function mainHandleRelayId(id: string): string
-
-export declare function mainHasFileClipboard(): boolean
-
-export declare function mainHasGpuTextureRender(): boolean
-
-export declare function mainHasHwcodec(): boolean
-
-export declare function mainHasValid2FaSync(): boolean
-
-export declare function mainHasValidBotSync(): boolean
-
-export declare function mainHasVram(): boolean
-
-export declare function mainHideDock(): boolean
-
-export declare function mainInitInputSource(): void
-
-export declare function mainIsCanInputMonitoring(prompt: boolean): boolean
-
-export declare function mainIsCanScreenRecording(prompt: boolean): boolean
-
-export declare function mainIsInstalled(): boolean
-
-export declare function mainIsInstalledDaemon(prompt: boolean): boolean
-
-export declare function mainIsInstalledLowerVersion(): boolean
-
-export declare function mainIsLoginWayland(): boolean
-
-export declare function mainIsOptionFixed(key: string): boolean
-
-export declare function mainIsProcessTrusted(prompt: boolean): boolean
-
-export declare function mainIsShareRdp(): boolean
-
-export declare function mainLoadFavPeers(): void
-
-export declare function mainLoadLanPeers(): void
-
-export declare function mainLoadRecentPeers(): void
-
-export declare function mainLoadRecentPeersForAb(filter: string): string
-
-export declare function mainMaxEncryptLen(): number
-
-export declare function mainPeerExists(id: string): boolean
-
-export declare function mainPeerHasPassword(id: string): boolean
-
-export declare function mainRemovePeer(id: string): void
-
-export declare function mainRemoveTrustedDevices(json: string): void
-
-export declare function mainSetCommon(key: string, value: string): void
-
-export declare function mainSetLocalOption(key: string, value: string): void
-
-export declare function mainSetOption(key: string, value: string): void
-
-export declare function mainSetOptions(json: string): void
-
-export declare function mainSetPeerAlias(id: string, alias: string): void
-
-export declare function mainSetPeerFlutterOptionSync(id: string, key: string, value: string): void
-
-export declare function mainSetPeerOption(id: string, key: string, value: string): void
-
-export declare function mainSetPeerOptionSync(id: string, key: string, value: string): boolean
-
-export declare function mainSetShareRdp(enable: boolean): void
-
-export declare function mainSetUnlockPin(pin: string): string
-
-export declare function mainSetUserDefaultOption(key: string, value: string): void
-
-export declare function mainStoreFav(favs: Array<string>): void
-
-export declare function mainSupportRemoveWallpaper(): boolean
-
-export declare function mainSupportedHwdecodings(): string
-
-export declare function mainSupportedInputSource(): string
-
-export declare function mainSupportedPrivacyModeImpls(): string
-
-export declare function mainUpdateMe(): boolean
-
-export declare function mainUpdateTemporaryPassword(): void
-
-export declare function mainVerify2Fa(code: string): boolean
-
-export declare function mainVerifyBot(token: string): string
-
-export declare function mainWol(id: string): void
-
 export declare function nativeVersion(): string
 
 export declare function runtimeGetApiServer(): string
@@ -316,67 +112,25 @@ export declare function sessionClose(sessionId: string): string
 
 export declare function sessionEnterOrLeave(sessionId: string, enter: boolean): string
 
-export declare function sessionGetAuditGuid(sessionId: string): string
-
-export declare function sessionGetAuditServerSync(sessionId: string, typ: string): string
-
-export declare function sessionGetCommon(sessionId: string, key: string, param: string): string | null
-
-export declare function sessionGetCommonSync(sessionId: string, key: string, param: string): string | null
-
-export declare function sessionGetConnSessionId(sessionId: string): string
-
 export declare function sessionGetConnToken(sessionId: string): string | null
-
-export declare function sessionGetCustomImageQuality(sessionId: string): Array<number> | null
-
-export declare function sessionGetDisplaysAsIndividualWindows(sessionId: string): string | null
-
-export declare function sessionGetEdgeScrollEdgeThickness(sessionId: string): number | null
 
 export declare function sessionGetEnableTrustedDevices(sessionId: string): boolean
 
-export declare function sessionGetFlutterOption(sessionId: string, key: string): string | null
-
 export declare function sessionGetImageQuality(sessionId: string): string | null
-
-export declare function sessionGetIsRecording(sessionId: string): boolean
-
-export declare function sessionGetKeyboardMode(sessionId: string): string | null
-
-export declare function sessionGetLastAuditNote(sessionId: string): string
-
-export declare function sessionGetOption(sessionId: string, arg: string): string | null
-
-export declare function sessionGetPeerOption(sessionId: string, name: string): string
-
-export declare function sessionGetRemember(sessionId: string): boolean | null
 
 export declare function sessionGetRenderStats(sessionId: string, display: number): string
 
 export declare function sessionGetRemoteAudioState(sessionId: string): string
 
-export declare function sessionGetReverseMouseWheelSync(sessionId: string): string | null
-
 export declare function sessionGetRgbaSize(sessionId: string, display: number): number
 
-export declare function sessionGetScrollStyle(sessionId: string): string | null
-
 export declare function sessionGetToggleOption(sessionId: string, arg: string): boolean
-
-export declare function sessionGetTrackpadSpeed(sessionId: string): number | null
-
-export declare function sessionGetUseAllMyDisplaysForTheRemoteSession(sessionId: string): string | null
-
-export declare function sessionGetViewStyle(sessionId: string): string | null
 
 export declare function sessionHandleFlutterKeyEvent(sessionId: string, keyJson: string): string
 
 export declare function sessionInputKey(sessionId: string, keyJson: string): string
 
 export declare function sessionInputString(sessionId: string, value: string): string
-
-export declare function sessionIsKeyboardModeSupported(sessionId: string, mode: string): boolean
 
 export declare function sessionLogin(sessionId: string, loginJson: string): string
 
@@ -408,8 +162,6 @@ export declare function sessionSendNote(sessionId: string, note: string): void
 
 export declare function sessionSendPointer(sessionId: string, pointerJson: string): string
 
-export declare function sessionSetAuditGuid(sessionId: string, guid: string): void
-
 export declare function sessionSetCodecPreference(sessionId: string, codec: string): string
 
 export declare function sessionSetCommon(sessionId: string, key: string, value: string): void
@@ -420,29 +172,11 @@ export declare function sessionSetCustomFps(sessionId: string, fps: number): str
 
 export declare function sessionSetCustomImageQuality(sessionId: string, value: number): void
 
-export declare function sessionSetDisplaysAsIndividualWindows(sessionId: string, value: string): void
-
-export declare function sessionSetEdgeScrollEdgeThickness(sessionId: string, value: number): void
-
-export declare function sessionSetFlutterOption(sessionId: string, key: string, value: string): void
-
 export declare function sessionSetImageQuality(sessionId: string, value: string): string
-
-export declare function sessionSetKeyboardMode(sessionId: string, value: string): void
-
-export declare function sessionSetReverseMouseWheel(sessionId: string, value: string): void
-
-export declare function sessionSetScrollStyle(sessionId: string, value: string): void
 
 export declare function sessionSetShowRemoteCursor(sessionId: string, enabled: boolean): string
 
 export declare function sessionSetSize(sessionId: string, display: number, width: number, height: number): string
-
-export declare function sessionSetTrackpadSpeed(sessionId: string, value: number): void
-
-export declare function sessionSetUseAllMyDisplaysForTheRemoteSession(sessionId: string, value: string): void
-
-export declare function sessionSetViewStyle(sessionId: string, value: string): void
 
 export declare function sessionStart(sessionId: string): string
 
