@@ -4834,7 +4834,18 @@ pub fn session_on_waiting_for_image_dialog_show(session_id: String) -> String {
             let Some(core_session_id) = parse_core_session_id(session) else {
                 return (false, "Missing core session id".to_string());
             };
+            let should_activate_remote_input =
+                !session.view_only && session.conn_type == "default_conn";
+            let activation_session_id = core_session_id.clone();
             flutter_ffi::session_on_waiting_for_image_dialog_show(core_session_id);
+            if should_activate_remote_input {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    // Wake the remote login screen without collecting or sending
+                    // a password here. Existing keyboard and IME paths deliver input.
+                    flutter_ffi::session_input_os_password(activation_session_id, String::new());
+                });
+            }
             session.last_error = None;
             (true, "Forwarded waiting-for-image notification".to_string())
         },
