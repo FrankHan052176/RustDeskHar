@@ -442,6 +442,8 @@ static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 static SESSIONS: OnceLock<Mutex<HashMap<String, BridgeSession>>> = OnceLock::new();
 static SURFACE_BINDINGS: OnceLock<Mutex<HashMap<(String, u32), SurfaceBinding>>> = OnceLock::new();
 static CORE_EVENT_QUEUES: OnceLock<Mutex<HashMap<String, VecDeque<Value>>>> = OnceLock::new();
+static CLIENT_CLIPBOARD_IMAGES: OnceLock<Mutex<HashMap<String, VecDeque<NativeClipboardImage>>>> =
+    OnceLock::new();
 static RENDER_STATS: OnceLock<Mutex<HashMap<String, HashMap<usize, RenderStats>>>> =
     OnceLock::new();
 static INPUT_INTERCEPTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -481,6 +483,12 @@ const MAX_CONTROLLED_QUEUE_ITEMS: usize = 256;
 const MAX_CONTROLLED_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTROLLED_FRAME_BYTES: usize = 32 * 1024 * 1024;
 const MAX_CONTROLLED_CLIPBOARD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CLIENT_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CLIENT_CLIPBOARD_FILES: usize = 64;
+
+struct NativeClipboardImage {
+    bytes: Vec<u8>,
+}
 const MAX_CONTROLLED_PASSWORD_BYTES: usize = 256;
 const CONTROLLED_CAPTURE_LOGICAL_HANDLE: u64 = 1;
 const CONTROLLED_PIXELMAP_MAX_DIMENSION: usize = 1_920;
@@ -2057,6 +2065,11 @@ fn surface_binding_store() -> &'static Mutex<HashMap<(String, u32), SurfaceBindi
 
 fn core_event_queue_store() -> &'static Mutex<HashMap<String, VecDeque<Value>>> {
     CORE_EVENT_QUEUES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn client_clipboard_image_store() -> &'static Mutex<HashMap<String, VecDeque<NativeClipboardImage>>>
+{
+    CLIENT_CLIPBOARD_IMAGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn render_stats_store() -> &'static Mutex<HashMap<String, HashMap<usize, RenderStats>>> {
@@ -4151,6 +4164,10 @@ pub fn session_close(session_id: String) -> String {
         flutter_ffi::session_close(core_session_id);
         clear_core_state(&core_session_key);
     }
+    client_clipboard_image_store()
+        .lock()
+        .unwrap()
+        .remove(&session_id);
 
     let mut sessions = session_store().lock().unwrap();
     let Some(session) = sessions.get_mut(&session_id) else {
@@ -4480,12 +4497,23 @@ pub fn session_send_clipboard(session_id: String, content: String) -> String {
                 "Clipboard is only available for remote-control sessions".to_string(),
             );
         }
-        let Some(_core_session_id) = parse_core_session_id(session) else {
+        let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
         #[cfg(target_env = "ohos")]
         {
-            if ohos::update_client_text_clipboard(content.clone()) {
+            let queued = flutter::session_send_clipboards(
+                core_session_id,
+                MultiClipboards {
+                    clipboards: vec![Clipboard {
+                        content: content.clone().into_bytes().into(),
+                        format: ClipboardFormat::Text.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            if queued {
                 session.last_error = None;
                 (true, "Queued text clipboard for RustDesk".to_string())
             } else {
@@ -4498,13 +4526,312 @@ pub fn session_send_clipboard(session_id: String, content: String) -> String {
         }
         #[cfg(not(target_env = "ohos"))]
         {
-            let _ = (&_core_session_id, &content);
+            let _ = (&core_session_id, &content);
             (
                 false,
                 "Clipboard bridge is only available on HarmonyOS".to_string(),
             )
         }
     })
+}
+
+#[napi]
+pub fn session_send_clipboard_image(
+    session_id: String,
+    image: napi_ohos::bindgen_prelude::Uint8Array,
+) -> String {
+    let bytes = image.to_vec();
+    update_session(&session_id, "session_send_clipboard_image", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        if session.view_only {
+            return (
+                false,
+                "Clipboard is disabled for a view-only session".to_string(),
+            );
+        }
+        if session.conn_type != "default_conn" {
+            return (
+                false,
+                "Clipboard is only available for remote-control sessions".to_string(),
+            );
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        if bytes.is_empty() || bytes.len() > MAX_CLIENT_CLIPBOARD_IMAGE_BYTES {
+            return (
+                false,
+                "Clipboard image must be between 1 byte and 64 MiB".to_string(),
+            );
+        }
+        #[cfg(target_env = "ohos")]
+        {
+            let queued = flutter::session_send_clipboards(
+                core_session_id,
+                MultiClipboards {
+                    clipboards: vec![Clipboard {
+                        content: bytes.clone().into(),
+                        format: ClipboardFormat::ImagePng.into(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            );
+            if queued {
+                session.last_error = None;
+                (true, "Queued PNG clipboard image for RustDesk".to_string())
+            } else {
+                let message =
+                    "Clipboard synchronization is disabled by the current session permissions"
+                        .to_string();
+                session.last_error = Some(message.clone());
+                (false, message)
+            }
+        }
+        #[cfg(not(target_env = "ohos"))]
+        {
+            let _ = (&core_session_id, &bytes);
+            (
+                false,
+                "Clipboard bridge is only available on HarmonyOS".to_string(),
+            )
+        }
+    })
+}
+
+#[napi]
+pub fn session_send_clipboard_files(session_id: String, paths_json: String) -> String {
+    let paths: Vec<String> = match serde_json::from_str(&paths_json) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return json!({"ok":false,"action":"session_send_clipboard_files","message":format!("Invalid file clipboard payload: {error}")}).to_string();
+        }
+    };
+    if paths.is_empty() || paths.len() > MAX_CLIENT_CLIPBOARD_FILES {
+        return json!({"ok":false,"action":"session_send_clipboard_files","message":"File clipboard must contain between 1 and 64 paths"}).to_string();
+    }
+    if paths
+        .iter()
+        .any(|path| path.is_empty() || path.len() > 4096)
+    {
+        return json!({"ok":false,"action":"session_send_clipboard_files","message":"File clipboard contains an invalid path"}).to_string();
+    }
+    update_session(&session_id, "session_send_clipboard_files", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        if session.view_only {
+            return (
+                false,
+                "Clipboard is disabled for a view-only session".to_string(),
+            );
+        }
+        if session.conn_type != "default_conn" {
+            return (
+                false,
+                "Clipboard is only available for remote-control sessions".to_string(),
+            );
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        #[cfg(target_env = "ohos")]
+        {
+            match ohos::update_client_file_clipboard(core_session_id, paths.clone()) {
+                Ok(()) => {
+                    session.last_error = None;
+                    (true, "Queued file clipboard for RustDesk".to_string())
+                }
+                Err(message) => {
+                    session.last_error = Some(message.clone());
+                    (false, message)
+                }
+            }
+        }
+        #[cfg(not(target_env = "ohos"))]
+        {
+            let _ = (&_core_session_id, &paths);
+            (
+                false,
+                "Clipboard bridge is only available on HarmonyOS".to_string(),
+            )
+        }
+    })
+}
+
+#[napi]
+pub fn session_set_clipboard_file_root(session_id: String, root: String) -> String {
+    if root.is_empty() || root.len() > 4096 {
+        return json!({"ok":false,"action":"session_set_clipboard_file_root","message":"Clipboard file root is invalid"}).to_string();
+    }
+    let safe_session_id = session_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let root_path = std::path::Path::new(&root);
+    let has_unsafe_component = root_path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::CurDir | std::path::Component::ParentDir
+        )
+    });
+    let valid_leaf =
+        root_path.file_name().and_then(|name| name.to_str()) == Some(safe_session_id.as_str());
+    let valid_parent = root_path
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("rustdesk-clipboard-in");
+    if !root_path.is_absolute() || has_unsafe_component || !valid_leaf || !valid_parent {
+        return json!({"ok":false,"action":"session_set_clipboard_file_root","message":"Clipboard file root must be a dedicated session directory"}).to_string();
+    }
+    update_session(&session_id, "session_set_clipboard_file_root", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        #[cfg(target_env = "ohos")]
+        {
+            match ohos::set_client_clipboard_file_root(&core_session_id, root.clone()) {
+                Ok(()) => {
+                    session.last_error = None;
+                    (true, "Configured clipboard file root".to_string())
+                }
+                Err(message) => {
+                    session.last_error = Some(message.clone());
+                    (false, message)
+                }
+            }
+        }
+        #[cfg(not(target_env = "ohos"))]
+        {
+            let _ = (&core_session_id, &root);
+            (
+                false,
+                "Clipboard bridge is only available on HarmonyOS".to_string(),
+            )
+        }
+    })
+}
+
+#[napi]
+pub fn session_take_clipboard(session_id: String) -> String {
+    let Some(core_session_id) = core_session_id_for(&session_id) else {
+        return json!({"ok":false,"action":"session_take_clipboard","message":"Missing core session id"}).to_string();
+    };
+    #[cfg(target_env = "ohos")]
+    {
+        let Some(clipboards) = ohos::take_client_received_clipboards(&core_session_id) else {
+            return json!({"ok":false,"action":"session_take_clipboard","message":"No native clipboard payload is available"}).to_string();
+        };
+        let mut text: Option<String> = None;
+        let mut html: Option<String> = None;
+        let mut image_meta = Value::Null;
+        let mut native_image: Option<NativeClipboardImage> = None;
+        for clipboard in clipboards.clipboards {
+            match clipboard.format.enum_value() {
+                Ok(ClipboardFormat::Text) if text.is_none() => {
+                    if clipboard.content.len() <= MAX_CONTROLLED_CLIPBOARD_BYTES {
+                        text = String::from_utf8(clipboard.content.to_vec()).ok();
+                    }
+                }
+                Ok(ClipboardFormat::Html) if html.is_none() => {
+                    if clipboard.content.len() <= MAX_CONTROLLED_CLIPBOARD_BYTES {
+                        html = String::from_utf8(clipboard.content.to_vec()).ok();
+                    }
+                }
+                Ok(ClipboardFormat::ImagePng)
+                    if native_image.is_none()
+                        && !clipboard.content.is_empty()
+                        && clipboard.content.len() <= MAX_CLIENT_CLIPBOARD_IMAGE_BYTES =>
+                {
+                    image_meta = json!({
+                        "format": "png",
+                        "width": clipboard.width,
+                        "height": clipboard.height,
+                        "byteLength": clipboard.content.len()
+                    });
+                    native_image = Some(NativeClipboardImage {
+                        bytes: clipboard.content.to_vec(),
+                    });
+                }
+                Ok(ClipboardFormat::ImageRgba)
+                    if native_image.is_none()
+                        && clipboard.width > 0
+                        && clipboard.height > 0
+                        && clipboard.content.len() <= MAX_CLIENT_CLIPBOARD_IMAGE_BYTES =>
+                {
+                    let expected = usize::try_from(clipboard.width)
+                        .ok()
+                        .and_then(|width| {
+                            usize::try_from(clipboard.height)
+                                .ok()
+                                .and_then(|height| width.checked_mul(height))
+                        })
+                        .and_then(|pixels| pixels.checked_mul(4));
+                    if expected == Some(clipboard.content.len()) {
+                        image_meta = json!({
+                            "format": "rgba",
+                            "width": clipboard.width,
+                            "height": clipboard.height,
+                            "byteLength": clipboard.content.len()
+                        });
+                        native_image = Some(NativeClipboardImage {
+                            bytes: clipboard.content.to_vec(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(image) = native_image {
+            let mut store = client_clipboard_image_store().lock().unwrap();
+            let queue = store.entry(session_id).or_default();
+            if queue.len() >= 2 {
+                queue.pop_front();
+            }
+            queue.push_back(image);
+        }
+        return json!({
+            "ok": text.is_some() || html.is_some() || !image_meta.is_null(),
+            "action": "session_take_clipboard",
+            "text": text,
+            "html": html,
+            "image": image_meta
+        })
+        .to_string();
+    }
+    #[cfg(not(target_env = "ohos"))]
+    {
+        let _ = core_session_id;
+        json!({"ok":false,"action":"session_take_clipboard","message":"Clipboard bridge is only available on HarmonyOS"}).to_string()
+    }
+}
+
+#[napi]
+pub fn session_take_clipboard_image(session_id: String) -> napi_ohos::bindgen_prelude::Uint8Array {
+    let mut store = client_clipboard_image_store().lock().unwrap();
+    let Some(queue) = store.get_mut(&session_id) else {
+        return Vec::new().into();
+    };
+    let image = queue
+        .pop_front()
+        .map(|image| image.bytes)
+        .unwrap_or_default();
+    if queue.is_empty() {
+        store.remove(&session_id);
+    }
+    image.into()
 }
 
 #[napi]
@@ -6623,6 +6950,30 @@ pub fn session_refresh(session_id: String, display: u32) -> String {
         (
             true,
             format!("Requested RustDesk video refresh for display {}", display),
+        )
+    })
+}
+
+#[napi]
+pub fn session_set_video_paused(session_id: String, paused: bool) -> String {
+    update_session(&session_id, "session_set_video_paused", |session| {
+        if session.phase == "closed" {
+            return (false, "Session is closed".to_string());
+        }
+        let Some(core_session_id) = parse_core_session_id(session) else {
+            return (false, "Missing core session id".to_string());
+        };
+        if !flutter::session_set_video_paused(core_session_id, paused) {
+            return (false, "Core session was not found".to_string());
+        }
+        session.last_error = None;
+        (
+            true,
+            if paused {
+                "Paused video decoding".to_string()
+            } else {
+                "Resumed video decoding".to_string()
+            },
         )
     })
 }

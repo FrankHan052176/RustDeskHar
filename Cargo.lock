@@ -1004,10 +1004,12 @@ name = "clipboard"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "dashmap 5.5.3",
  "dirs 5.0.1",
  "fsevent",
  "hbb_common",
  "lazy_static",
+ "libc",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
  "objc2-foundation 0.2.2",
@@ -1015,6 +1017,7 @@ dependencies = [
  "serde 1.0.228",
  "serde_derive",
  "thiserror 1.0.61",
+ "utf16string",
  "uuid",
  "xattr",
 ]
@@ -1536,6 +1539,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57967e4b200d767d091b961d6ab42cc7d0cc14fe9e052e75d0d3cf9eb732d895"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "dashmap"
+version = "5.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
+dependencies = [
+ "cfg-if 1.0.0",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
 ]
 
 [[package]]
@@ -3747,7 +3763,7 @@ dependencies = [
  "bitflags 2.9.1",
  "bytes",
  "cc",
- "dashmap",
+ "dashmap 6.1.0",
  "log",
  "parking_lot",
  "rand 0.8.5",
@@ -6508,6 +6524,7 @@ dependencies = [
  "winreg 0.11.0",
  "winres",
  "wol-rs",
+ "zstd",
 ]
 
 [[package]]
@@ -8335,6 +8352,15 @@ name = "utf-8"
 version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09cc8ee72d2a9becf2f2febe0205bbed8fc6615b7cb429ad062dc7b7ddd036a9"
+
+[[package]]
+name = "utf16string"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b62a1e85e12d5d712bf47a85f426b73d303e2d00a90de5f3004df3596e9d216"
+dependencies = [
+ "byteorder",
+]
 
 [[package]]
 name = "utf8-width"

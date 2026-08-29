@@ -148,11 +148,19 @@ export declare function sessionReconnect(sessionId: string, forceRelay: boolean)
 
 export declare function sessionRefresh(sessionId: string, display: number): string
 
+export declare function sessionSetVideoPaused(sessionId: string, paused: boolean): string
+
 export declare function sessionSend2Fa(sessionId: string, code: string, trustThisDevice: boolean): string
 
 export declare function sessionSendChat(sessionId: string, text: string): string
 
 export declare function sessionSendClipboard(sessionId: string, content: string): string
+
+export declare function sessionSendClipboardImage(sessionId: string, image: Uint8Array): string
+
+export declare function sessionSendClipboardFiles(sessionId: string, pathsJson: string): string
+
+export declare function sessionSetClipboardFileRoot(sessionId: string, root: string): string
 
 export declare function sessionSendFiles(sessionId: string, actId: number, path: string, to: string, fileNum: number, includeHidden: boolean, isRemote: boolean, isDir: boolean): string
 
@@ -161,6 +169,10 @@ export declare function sessionSendMouse(sessionId: string, mouseJson: string): 
 export declare function sessionSendNote(sessionId: string, note: string): void
 
 export declare function sessionSendPointer(sessionId: string, pointerJson: string): string
+
+export declare function sessionTakeClipboard(sessionId: string): string
+
+export declare function sessionTakeClipboardImage(sessionId: string): Uint8Array
 
 export declare function sessionSetCodecPreference(sessionId: string, codec: string): string
 

@@ -279,6 +279,10 @@ export function sessionRefresh(sessionId: string, display: number): string {
   return native.sessionRefresh(sessionId, display);
 }
 
+export function sessionSetVideoPaused(sessionId: string, paused: boolean): string {
+  return native.sessionSetVideoPaused(sessionId, paused);
+}
+
 export function sessionSend2Fa(sessionId: string, code: string, trustThisDevice: boolean): string {
   return native.sessionSend2Fa(sessionId, code, trustThisDevice);
 }
@@ -289,6 +293,18 @@ export function sessionSendChat(sessionId: string, text: string): string {
 
 export function sessionSendClipboard(sessionId: string, content: string): string {
   return native.sessionSendClipboard(sessionId, content);
+}
+
+export function sessionSendClipboardImage(sessionId: string, image: Uint8Array): string {
+  return native.sessionSendClipboardImage(sessionId, image);
+}
+
+export function sessionSendClipboardFiles(sessionId: string, pathsJson: string): string {
+  return native.sessionSendClipboardFiles(sessionId, pathsJson);
+}
+
+export function sessionSetClipboardFileRoot(sessionId: string, root: string): string {
+  return native.sessionSetClipboardFileRoot(sessionId, root);
 }
 
 export function sessionSendFiles(sessionId: string, actId: number, path: string, to: string, fileNum: number, includeHidden: boolean, isRemote: boolean, isDir: boolean): string {
@@ -305,6 +321,14 @@ export function sessionSendNote(sessionId: string, note: string): void {
 
 export function sessionSendPointer(sessionId: string, pointerJson: string): string {
   return native.sessionSendPointer(sessionId, pointerJson);
+}
+
+export function sessionTakeClipboard(sessionId: string): string {
+  return native.sessionTakeClipboard(sessionId);
+}
+
+export function sessionTakeClipboardImage(sessionId: string): Uint8Array {
+  return native.sessionTakeClipboardImage(sessionId);
 }
 
 export function sessionSetCodecPreference(sessionId: string, codec: string): string {
