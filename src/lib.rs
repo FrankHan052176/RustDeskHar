@@ -2653,15 +2653,21 @@ pub async fn runtime_test_server_config(config_json: String) -> String {
     let errors = test_server_config(&config).await;
     let ok = server_config_errors_empty(&errors);
     let has_server = server_config_has_endpoint(&config);
+    let official = json_field_string(&config, "mode") == "official";
     if let Some(fields) = config.as_object_mut() {
-        fields.insert("remoteReachable".to_string(), (ok && has_server).into());
+        fields.insert(
+            "remoteReachable".to_string(),
+            (ok && has_server && !official).into(),
+        );
         fields.insert(
             "effectiveApiServer".to_string(),
             configured_api_server().into(),
         );
         fields.insert(
             "resultState".to_string(),
-            (if ok {
+            (if official {
+                "not-applicable"
+            } else if ok {
                 if has_server {
                     "test-success"
                 } else {
@@ -2677,7 +2683,9 @@ pub async fn runtime_test_server_config(config_json: String) -> String {
       "ok": ok,
       "action": "runtime_test_server_config",
       "message": if ok {
-          if has_server {
+          if official {
+              "官方模式无需测试地址；测试不会应用草稿，请点击“保存并应用”后生效"
+          } else if has_server {
               "已填写的服务器均返回了有效的 RustDesk 服务响应"
           } else {
               "未配置服务器；将使用局域网直连或手动直连"
@@ -2741,15 +2749,18 @@ pub fn runtime_set_server_config(config_json: String) -> String {
         clear_account_state();
     }
 
+    let official = json_field_string(&config, "mode") == "official";
     let mut saved_config = server_config_snapshot();
     if let Some(fields) = saved_config.as_object_mut() {
-        fields.insert("remoteReachable".to_string(), false.into());
+        fields.insert("remoteReachable".to_string(), official.into());
         fields.insert("resultState".to_string(), "save-success".into());
     }
     json!({
       "ok": true,
       "action": "runtime_set_server_config",
-      "message": if server_config_has_endpoint(&config) {
+      "message": if official {
+          "已恢复内置 RustDesk 官方服务器"
+      } else if server_config_has_endpoint(&config) {
           "服务器配置已保存；可点击“测试配置”检查连接"
       } else {
           "服务器配置已清空；当前不使用自定义服务器"
@@ -8330,13 +8341,7 @@ fn configured_id_server() -> String {
 }
 
 fn configured_api_server() -> String {
-    let id_server = configured_id_server();
-    let api_server = flutter_ffi::main_get_option("api-server".to_string());
-    if id_server.is_empty() && api_server.trim().is_empty() {
-        String::new()
-    } else {
-        flutter_ffi::main_get_api_server()
-    }
+    flutter_ffi::main_get_api_server()
 }
 
 fn server_config_snapshot() -> Value {
@@ -8347,18 +8352,29 @@ fn server_config_snapshot() -> Value {
     let api_server = json_field_string(&options, "api-server");
     let key = json_field_string(&options, "key");
     let effective_api_server = configured_api_server();
+    let using_public_server = flutter_ffi::main_is_using_public_server();
+    let mode = if using_public_server
+        && id_server.is_empty()
+        && relay_server.is_empty()
+        && api_server.is_empty()
+        && key.is_empty()
+    {
+        "official"
+    } else {
+        "custom"
+    };
     let account_available = !effective_api_server.is_empty()
         && !flutter_ffi::main_get_local_option("access_token".to_string())
             .0
             .is_empty();
     json!({
-      "mode": "custom",
+      "mode": mode,
       "idServer": id_server,
       "relayServer": relay_server,
       "apiServer": api_server,
       "key": key,
       "effectiveApiServer": effective_api_server,
-      "usingPublicServer": false,
+      "usingPublicServer": using_public_server,
       "accountAvailable": account_available
     })
 }
@@ -8375,33 +8391,46 @@ fn parse_server_config(raw: &str) -> Result<Value, String> {
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if requested_mode == "official" {
-        return Err(
-            "Official server mode is not available; configure the server explicitly".to_string(),
-        );
-    }
-    if !requested_mode.is_empty() && requested_mode != "custom" {
+    if !requested_mode.is_empty() && requested_mode != "official" && requested_mode != "custom" {
         return Err(format!("Unsupported server mode {}", requested_mode));
     }
-    let id_server = normalize_server_endpoint(
+    let official = requested_mode == "official";
+    let mut id_server = normalize_server_endpoint(
         json_raw_string(&payload, &["idServer", "customRendezvousServer", "host"])
             .unwrap_or_default(),
     );
-    let relay_server = normalize_server_endpoint(
+    let mut relay_server = normalize_server_endpoint(
         json_raw_string(&payload, &["relayServer", "relay"]).unwrap_or_default(),
     );
-    let api_server = normalize_server_endpoint(
+    let mut api_server = normalize_server_endpoint(
         json_raw_string(&payload, &["apiServer", "api"]).unwrap_or_default(),
     );
-    let key = json_raw_string(&payload, &["key"])
+    let mut key = json_raw_string(&payload, &["key"])
         .unwrap_or_default()
         .trim()
         .to_string();
+    if official {
+        id_server.clear();
+        relay_server.clear();
+        api_server.clear();
+        key.clear();
+    }
+    let mode = if official
+        || (requested_mode.is_empty()
+            && id_server.is_empty()
+            && relay_server.is_empty()
+            && api_server.is_empty()
+            && key.is_empty())
+    {
+        "official"
+    } else {
+        "custom"
+    };
     let test_with_proxy = json_lookup(&payload, &["testWithProxy", "test_with_proxy"])
         .map(|_| json_bool(&payload, &["testWithProxy", "test_with_proxy"]))
         .unwrap_or(true);
     Ok(json!({
-      "mode": "custom",
+      "mode": mode,
       "idServer": id_server,
       "relayServer": relay_server,
       "apiServer": api_server,
@@ -8411,6 +8440,13 @@ fn parse_server_config(raw: &str) -> Result<Value, String> {
 }
 
 fn validate_server_config_format(config: &Value) -> Value {
+    if json_field_string(config, "mode") == "official" {
+        return json!({
+          "idServer": "",
+          "relayServer": "",
+          "apiServer": ""
+        });
+    }
     let id_server = json_field_string(config, "idServer");
     let relay_server = json_field_string(config, "relayServer");
     let api_server = json_field_string(config, "apiServer");
@@ -8444,6 +8480,13 @@ fn validate_server_config_format(config: &Value) -> Value {
 }
 
 async fn test_server_config(config: &Value) -> Value {
+    if json_field_string(config, "mode") == "official" {
+        return json!({
+          "idServer": "",
+          "relayServer": "",
+          "apiServer": ""
+        });
+    }
     let format_errors = validate_server_config_format(config);
     if !server_config_errors_empty(&format_errors) {
         return format_errors;
