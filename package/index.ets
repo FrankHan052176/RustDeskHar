@@ -219,10 +219,6 @@ export function sessionGetImageQuality(sessionId: string): string | null {
   return native.sessionGetImageQuality(sessionId);
 }
 
-export function sessionGetRenderStats(sessionId: string, display: number): string {
-  return native.sessionGetRenderStats(sessionId, display);
-}
-
 export function sessionGetRemoteAudioState(sessionId: string): string {
   return native.sessionGetRemoteAudioState(sessionId);
 }

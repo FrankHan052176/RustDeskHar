@@ -444,8 +444,6 @@ static SURFACE_BINDINGS: OnceLock<Mutex<HashMap<(String, u32), SurfaceBinding>>>
 static CORE_EVENT_QUEUES: OnceLock<Mutex<HashMap<String, VecDeque<Value>>>> = OnceLock::new();
 static CLIENT_CLIPBOARD_IMAGES: OnceLock<Mutex<HashMap<String, VecDeque<NativeClipboardImage>>>> =
     OnceLock::new();
-static RENDER_STATS: OnceLock<Mutex<HashMap<String, HashMap<usize, RenderStats>>>> =
-    OnceLock::new();
 static INPUT_INTERCEPTOR_ACTIVE: AtomicBool = AtomicBool::new(false);
 static INPUT_EVENT_QUEUE: OnceLock<Mutex<VecDeque<Value>>> = OnceLock::new();
 static ACCOUNT_JOB: OnceLock<Mutex<BackgroundJsonJob>> = OnceLock::new();
@@ -1950,78 +1948,6 @@ struct SurfaceBinding {
     decode_size: Option<(usize, usize)>,
 }
 
-struct RenderStats {
-    window_started_at: Instant,
-    frames_in_window: usize,
-    fps: f64,
-    total_frames: usize,
-    last_frame_at: Option<Instant>,
-    total_decode_latency_ms: u64,
-    decode_latency_samples: usize,
-}
-
-impl Default for RenderStats {
-    fn default() -> Self {
-        Self {
-            window_started_at: Instant::now(),
-            frames_in_window: 0,
-            fps: 0.0,
-            total_frames: 0,
-            last_frame_at: None,
-            total_decode_latency_ms: 0,
-            decode_latency_samples: 0,
-        }
-    }
-}
-
-impl RenderStats {
-    fn record_frame(&mut self, latency: Option<u64>) {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.window_started_at);
-        if elapsed.as_secs_f64() >= 1.0 {
-            self.fps = if self.frames_in_window > 0 {
-                self.frames_in_window as f64 / elapsed.as_secs_f64()
-            } else {
-                0.0
-            };
-            self.frames_in_window = 0;
-            self.window_started_at = now;
-        }
-        self.frames_in_window += 1;
-        self.total_frames += 1;
-        self.last_frame_at = Some(now);
-        if let Some(latency) = latency {
-            self.total_decode_latency_ms += latency;
-            self.decode_latency_samples += 1;
-        }
-    }
-
-    fn snapshot(&self) -> Value {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.window_started_at).as_secs_f64();
-        let fps = if self.frames_in_window > 0 && elapsed > 0.0 {
-            self.frames_in_window as f64 / elapsed
-        } else {
-            self.fps
-        };
-        let last_frame_age_ms = self
-            .last_frame_at
-            .map(|last_frame| now.duration_since(last_frame).as_millis() as u64)
-            .unwrap_or(0);
-        json!({
-            "fps": if last_frame_age_ms > 2000 { 0.0 } else { fps },
-            "totalFrames": self.total_frames,
-            "lastFrameAgeMs": last_frame_age_ms,
-            "hasRenderedFrame": self.last_frame_at.is_some(),
-            "avgDecodeLatencyMs": if self.decode_latency_samples == 0 {
-                0.0
-            } else {
-                self.total_decode_latency_ms as f64 / self.decode_latency_samples as f64
-            },
-        })
-    }
-}
-
 #[derive(Clone)]
 struct BridgeSession {
     session_id: String,
@@ -2070,10 +1996,6 @@ fn core_event_queue_store() -> &'static Mutex<HashMap<String, VecDeque<Value>>> 
 fn client_clipboard_image_store() -> &'static Mutex<HashMap<String, VecDeque<NativeClipboardImage>>>
 {
     CLIENT_CLIPBOARD_IMAGES.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn render_stats_store() -> &'static Mutex<HashMap<String, HashMap<usize, RenderStats>>> {
-    RENDER_STATS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn input_event_queue_store() -> &'static Mutex<VecDeque<Value>> {
@@ -2226,18 +2148,6 @@ fn update_bridge_session_from_event(session_id: flutter_ffi::SessionID, event: &
     }
 }
 
-#[cfg(target_env = "ohos")]
-fn record_render_stats(session_id: String, display: usize, latency: Option<u64>) {
-    render_stats_store()
-        .lock()
-        .unwrap()
-        .entry(session_id)
-        .or_default()
-        .entry(display)
-        .or_default()
-        .record_frame(latency);
-}
-
 fn take_core_events(session_id: &str, limit: usize) -> Vec<Value> {
     let mut queues = core_event_queue_store().lock().unwrap();
     let Some(queue) = queues.get_mut(session_id) else {
@@ -2251,28 +2161,8 @@ fn take_core_events(session_id: &str, limit: usize) -> Vec<Value> {
     queue.drain(..take).collect()
 }
 
-fn render_stats(session_id: &str, display: usize) -> Value {
-    let stats = render_stats_store()
-        .lock()
-        .unwrap()
-        .get(session_id)
-        .and_then(|per_display| per_display.get(&display))
-        .map(RenderStats::snapshot)
-        .unwrap_or_else(|| {
-            json!({
-                "fps": 0.0,
-                "totalFrames": 0,
-                "lastFrameAgeMs": 0,
-                "hasRenderedFrame": false,
-                "avgDecodeLatencyMs": 0.0,
-            })
-        });
-    json!({ "display": display, "stats": stats })
-}
-
 fn clear_core_state(session_id: &str) {
     core_event_queue_store().lock().unwrap().remove(session_id);
-    render_stats_store().lock().unwrap().remove(session_id);
 }
 
 #[cfg(target_env = "ohos")]
@@ -2300,7 +2190,6 @@ fn register_surface_lookup_once() {}
 #[cfg(target_env = "ohos")]
 fn register_core_callbacks() {
     ohos::register_session_event_callback(record_core_event);
-    ohos::register_render_stats_callback(record_render_stats);
 }
 
 #[cfg(not(target_env = "ohos"))]
@@ -2846,7 +2735,7 @@ pub async fn runtime_query_peer_online_states(peer_ids_json: String) -> String {
         })
         .to_string();
     }
-    match librustdesk::query_online_states_result(ids).await {
+    match librustdesk::platform::ohos::query_online_states_result(ids).await {
         Ok((onlines, offlines)) => json!({
           "ok": true,
           "action": "runtime_query_peer_online_states",
@@ -3100,7 +2989,7 @@ fn runtime_scan_lan_peers_blocking() -> String {
     // consumes its load_lan_peers events. ArkTS has a request/response bridge,
     // so run the identical Core routine on this worker and wait for its final
     // snapshot instead of reimplementing PeerDiscovery in the HAR.
-    if let Err(message) = flutter_ffi::main_discover_blocking() {
+    if let Err(message) = librustdesk::platform::ohos::discover_lan_blocking() {
         return json!({
           "ok": false,
           "action": "runtime_scan_lan_peers",
@@ -4513,7 +4402,7 @@ pub fn session_send_clipboard(session_id: String, content: String) -> String {
         };
         #[cfg(target_env = "ohos")]
         {
-            let queued = flutter::session_send_clipboards(
+            let queued = librustdesk::platform::ohos::session_send_clipboards(
                 core_session_id,
                 MultiClipboards {
                     clipboards: vec![Clipboard {
@@ -4579,7 +4468,7 @@ pub fn session_send_clipboard_image(
         }
         #[cfg(target_env = "ohos")]
         {
-            let queued = flutter::session_send_clipboards(
+            let queued = librustdesk::platform::ohos::session_send_clipboards(
                 core_session_id,
                 MultiClipboards {
                     clipboards: vec![Clipboard {
@@ -5992,7 +5881,8 @@ pub fn controlled_two_factor_verify(code: String) -> String {
 
 #[napi]
 pub fn controlled_two_factor_disable() -> String {
-    flutter_ffi::main_disable2fa();
+    flutter_ffi::main_set_option("2fa".to_owned(), String::new());
+    flutter_ffi::main_clear_trusted_devices();
     let enabled = flutter_ffi::main_has_valid_2fa_sync().0;
     let state = controlled_runtime().lock().unwrap();
     controlled_response(
@@ -6905,9 +6795,7 @@ pub fn session_take_rgba_frame(
     let Some(core_session_id) = core_session_id_for(&session_id) else {
         return Vec::new().into();
     };
-    flutter_ffi::session_take_rgba_frame(core_session_id, display as usize)
-        .0
-        .into()
+    flutter::session_take_rgba_frame(core_session_id, display as usize).into()
 }
 
 #[napi]
@@ -6974,9 +6862,11 @@ pub fn session_set_video_paused(session_id: String, paused: bool) -> String {
         let Some(core_session_id) = parse_core_session_id(session) else {
             return (false, "Missing core session id".to_string());
         };
-        if !flutter::session_set_video_paused(core_session_id, paused) {
+        let Some(core_session) = flutter::sessions::get_session_by_session_id(&core_session_id)
+        else {
             return (false, "Core session was not found".to_string());
-        }
+        };
+        core_session.set_video_paused(paused);
         session.last_error = None;
         (
             true,
@@ -6987,36 +6877,6 @@ pub fn session_set_video_paused(session_id: String, paused: bool) -> String {
             },
         )
     })
-}
-
-#[napi]
-pub fn session_get_render_stats(session_id: String, display: u32) -> String {
-    let sessions = session_store().lock().unwrap();
-    let Some(session) = sessions.get(&session_id) else {
-        return action_response(
-            "session_get_render_stats",
-            false,
-            format!("Session {} was not found", session_id),
-            None,
-        );
-    };
-    let Some(core_session_id) = parse_core_session_id(session) else {
-        return action_response(
-            "session_get_render_stats",
-            false,
-            "Missing core session id".to_string(),
-            Some(session),
-        );
-    };
-    let stats = render_stats(&core_session_id.to_string(), display as usize);
-    json!({
-      "ok": true,
-      "action": "session_get_render_stats",
-      "stats": stats,
-      "session": session_value(session),
-      "upstream": upstream_status_value()
-    })
-    .to_string()
 }
 
 #[napi]
@@ -8729,7 +8589,7 @@ async fn test_api_server_response(api_server: Option<String>, test_with_proxy: b
 }
 
 fn test_api_server_response_sync(api_server: &str, test_with_proxy: bool) -> String {
-    match librustdesk::validate_rustdesk_api_server(api_server, test_with_proxy) {
+    match librustdesk::platform::ohos::validate_api_server(api_server, test_with_proxy) {
         Ok(_) => String::new(),
         Err(err) => format!("RustDesk API 校验失败: {err}"),
     }

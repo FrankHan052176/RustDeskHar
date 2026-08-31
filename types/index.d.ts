@@ -118,8 +118,6 @@ export declare function sessionGetEnableTrustedDevices(sessionId: string): boole
 
 export declare function sessionGetImageQuality(sessionId: string): string | null
 
-export declare function sessionGetRenderStats(sessionId: string, display: number): string
-
 export declare function sessionGetRemoteAudioState(sessionId: string): string
 
 export declare function sessionGetRgbaSize(sessionId: string, display: number): number
