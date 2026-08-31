@@ -21,7 +21,7 @@ env:
   OHRS_VERSION: 1.3.1
   PACKAGE_NAME: rustdesk-ohrs
   CORE_REPOSITORY: ${{ vars.CORE_REPOSITORY || 'FrankHan052176/rustdesk4ohos' }}
-  CORE_REF: ${{ vars.CORE_REF || 'feat/ohos-unified-core-flutter' }}
+  CORE_REF: ${{ vars.CORE_REF || 'master' }}
   ARKTS_REPOSITORY: ${{ vars.ARKTS_REPOSITORY || 'FrankHan052176/RustDesk-ArkTS' }}
   CODEARTS_OHPM_REGISTRY: https://devrepo.devcloud.cn-north-4.huaweicloud.com/artgalaxy/api/ohpm/cn-north-4_c07b1b38744f424b8d87a86532d38003_ohpm_1/
 
