@@ -3977,7 +3977,7 @@ dependencies = [
 [[package]]
 name = "libsodium-sys"
 version = "0.2.7"
-source = "git+https://github.com/FrankHan052176/sodiumoxide?branch=master#a09de89d843f88a7bfccd80266150fe5d33e1eee"
+source = "git+https://github.com/FrankHan052176/sodiumoxide?rev=a09de89d843f88a7bfccd80266150fe5d33e1eee#a09de89d843f88a7bfccd80266150fe5d33e1eee"
 dependencies = [
  "cc",
  "libc",

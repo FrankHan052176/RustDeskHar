@@ -27,7 +27,7 @@ napi-build-ohos = { version = "1.0" }
 # Keep the RustDesk dependency graph unchanged and patch only the native
 # libsodium build used by this OHOS HAR.
 [patch.crates-io]
-libsodium-sys = { git = "https://github.com/FrankHan052176/sodiumoxide", branch = "master" }
+libsodium-sys = { git = "https://github.com/FrankHan052176/sodiumoxide", rev = "a09de89d843f88a7bfccd80266150fe5d33e1eee" }
 
 [profile.release]
 lto = true

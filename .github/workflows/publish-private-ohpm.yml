@@ -7,6 +7,12 @@ on:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+    inputs:
+      dispatch_downstream:
+        description: Dispatch ArkTS after publishing the HAR
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -142,6 +148,17 @@ jobs:
           jq --arg version "$version" '.version = $version' \
             R_RustDesk-Har/package/oh-package.json5 > "$RUNNER_TEMP/oh-package.json5"
           mv "$RUNNER_TEMP/oh-package.json5" R_RustDesk-Har/package/oh-package.json5
+          jq -n \
+            --arg core_sha "${CORE_SHA,,}" \
+            --arg har_sha "${GITHUB_SHA,,}" \
+            --arg package_name "$PACKAGE_NAME" \
+            --arg package_version "$version" \
+            '{
+              core_sha: $core_sha,
+              har_sha: $har_sha,
+              package_name: $package_name,
+              package_version: $package_version
+            }' > R_RustDesk-Har/package/release-provenance.json
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "$PACKAGE_NAME@$version"
 
@@ -171,6 +188,15 @@ jobs:
           set -euo pipefail
           cargo install ohrs --version "$OHRS_VERSION" --locked
           bash R_RustDesk-Har/scripts/build-har.sh
+          tar -xOzf R_RustDesk-Har/package.har package/release-provenance.json \
+            | jq -e \
+              --arg core_sha "${{ needs.source.outputs.sha }}" \
+              --arg har_sha "$GITHUB_SHA" \
+              --arg package_version "${{ steps.version.outputs.version }}" \
+              '.core_sha == ($core_sha | ascii_downcase)
+                and .har_sha == ($har_sha | ascii_downcase)
+                and .package_version == $package_version' \
+              >/dev/null
 
       - name: Artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -209,6 +235,7 @@ jobs:
         env:
           CODEARTS_PRIVATE_OHPM: ${{ secrets.CODEARTS_PRIVATE_OHPM }}
           CORE_SHA: ${{ needs.source.outputs.sha }}
+          PACKAGE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           set -euo pipefail
           : "${CODEARTS_PRIVATE_OHPM:?CODEARTS_PRIVATE_OHPM is required}"
@@ -220,8 +247,11 @@ jobs:
           ohpm publish --publish_registry "$CODEARTS_OHPM_REGISTRY" release/package.har
           mkdir -p "$RUNNER_TEMP/core-published"
           printf '%s\n' "$CORE_SHA" > "$RUNNER_TEMP/core-published/sha"
+          printf 'Published `%s@%s` from Core `%s` and HAR `%s`.\n' \
+            "$PACKAGE_NAME" "$PACKAGE_VERSION" "$CORE_SHA" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Dispatch
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dispatch_downstream }}
         shell: bash
         env:
           DOWNSTREAM_DISPATCH_TOKEN: ${{ secrets.DOWNSTREAM_DISPATCH_TOKEN }}
