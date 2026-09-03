@@ -159,6 +159,10 @@ export function runtimeProbePeerDirectStates(targetsJson: string): Promise<strin
   return native.runtimeProbePeerDirectStates(targetsJson);
 }
 
+export function runtimeRemoveDiscoveredPeer(peerId: string): string {
+  return native.runtimeRemoveDiscoveredPeer(peerId);
+}
+
 export function runtimeRemoveRecentPeer(peerId: string): string {
   return native.runtimeRemoveRecentPeer(peerId);
 }

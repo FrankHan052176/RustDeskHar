@@ -88,6 +88,8 @@ export declare function runtimeQueryPeerOnlineStates(peerIdsJson: string): Promi
 
 export declare function runtimeProbePeerDirectStates(targetsJson: string): Promise<string>
 
+export declare function runtimeRemoveDiscoveredPeer(peerId: string): string
+
 export declare function runtimeRemoveRecentPeer(peerId: string): string
 
 export declare function runtimeScanLanPeers(): Promise<string>

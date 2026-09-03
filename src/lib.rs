@@ -1,8 +1,5 @@
 use hbb_common::{
-    message_proto::{
-        message as peer_message, Clipboard, ClipboardFormat, Message as PeerMessage,
-        MultiClipboards,
-    },
+    message_proto::{Clipboard, ClipboardFormat, MultiClipboards},
     protobuf::Message as _,
     rendezvous_proto::{rendezvous_message, RendezvousMessage, RequestRelay, TestNatRequest},
     Stream,
@@ -16,9 +13,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_char, c_void, CStr},
-    fs,
-    net::{IpAddr, SocketAddr, TcpStream},
-    slice,
+    fs, slice,
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering},
@@ -2666,10 +2661,12 @@ pub fn runtime_list_recent_peers() -> String {
     let raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
     match parse_json_list(&raw, "recent peer list") {
         Ok(peers) => {
-            let target_ids = recent_route_target_ids();
+            // Core's Flutter-facing peer map includes the stored authentication hash so Flutter
+            // can reuse it internally. ArkTS does not need that credential-derived value: Core
+            // already owns saved authentication and resolves it by peer id when a session starts.
             let peers = peers
                 .iter()
-                .map(|peer| recent_peer_summary(peer, &target_ids))
+                .filter_map(public_peer_record)
                 .collect::<Vec<_>>();
             json!({
               "ok": true,
@@ -2755,48 +2752,10 @@ pub async fn runtime_query_peer_online_states(peer_ids_json: String) -> String {
     }
 }
 
-enum DirectPeerProbeOutcome {
-    Online,
-    Offline(String),
-    Unknown(String),
-}
-
-async fn probe_direct_peer_api(target: String) -> DirectPeerProbeOutcome {
-    let normalized = match validate_socket_target(&target, hbb_common::config::WS_RENDEZVOUS_PORT) {
-        Ok(target) => target,
-        Err(message) => return DirectPeerProbeOutcome::Unknown(message),
-    };
-    let mut stream = match connect_test_stream(normalized, false).await {
-        Ok(stream) => stream,
-        Err(message) => return DirectPeerProbeOutcome::Offline(message),
-    };
-    let Some(frame) = stream.next_timeout(1_500).await else {
-        return DirectPeerProbeOutcome::Unknown(
-            "端口可连接，但未收到 RustDesk 直连握手".to_string(),
-        );
-    };
-    let bytes = match frame {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return DirectPeerProbeOutcome::Unknown(format!("读取 RustDesk 直连握手失败: {error}"))
-        }
-    };
-    let message = match PeerMessage::parse_from_bytes(&bytes) {
-        Ok(message) => message,
-        Err(_) => {
-            return DirectPeerProbeOutcome::Unknown("端口响应不是 RustDesk 直连协议".to_string())
-        }
-    };
-    if matches!(
-        message.union,
-        Some(peer_message::Union::Hash(_)) | Some(peer_message::Union::SignedId(_))
-    ) {
-        DirectPeerProbeOutcome::Online
-    } else {
-        DirectPeerProbeOutcome::Unknown("端口未返回 RustDesk 直连认证握手".to_string())
-    }
-}
-
+// Compatibility bridge for ArkTS revisions published before Core-owned LAN identity replaced
+// route probing. Keep the symbol during the rolling three-repository upgrade, but deliberately do
+// not open sockets or infer peer identity from an IP address. Legacy callers treat unknown peers
+// as unchanged and therefore degrade safely until their source adopts runtimeRemoveDiscoveredPeer.
 #[napi]
 pub async fn runtime_probe_peer_direct_states(targets_json: String) -> String {
     let values = match serde_json::from_str::<Value>(&targets_json) {
@@ -2825,58 +2784,25 @@ pub async fn runtime_probe_peer_direct_states(targets_json: String) -> String {
         }
     };
     let mut seen = HashSet::new();
-    let mut targets = Vec::new();
-    for value in values.into_iter().take(64) {
-        let key = json_field_string(&value, "key");
-        let target = json_field_string(&value, "target");
-        if !key.is_empty() && !target.is_empty() && seen.insert(key.clone()) {
-            targets.push((key, target));
-        }
-    }
-    if targets.is_empty() {
-        return json!({
-          "ok": true,
-          "action": "runtime_probe_peer_direct_states",
-          "message": "No direct peers to probe",
-          "onlines": [],
-          "offlines": [],
-          "unknowns": []
+    let unknowns = values
+        .into_iter()
+        .take(64)
+        .filter_map(|value| {
+            let key = json_field_string(&value, "key");
+            if key.is_empty() || !seen.insert(key.clone()) {
+                None
+            } else {
+                Some(key)
+            }
         })
-        .to_string();
-    }
-
-    let mut tasks = hbb_common::tokio::task::JoinSet::new();
-    for (key, target) in targets {
-        tasks.spawn(async move { (key, probe_direct_peer_api(target).await) });
-    }
-    let mut onlines = Vec::new();
-    let mut offlines = Vec::new();
-    let mut unknowns = Vec::new();
-    let mut details = serde_json::Map::new();
-    while let Some(result) = tasks.join_next().await {
-        let Ok((key, outcome)) = result else {
-            continue;
-        };
-        match outcome {
-            DirectPeerProbeOutcome::Online => onlines.push(key),
-            DirectPeerProbeOutcome::Offline(message) => {
-                details.insert(key.clone(), Value::String(message));
-                offlines.push(key);
-            }
-            DirectPeerProbeOutcome::Unknown(message) => {
-                details.insert(key.clone(), Value::String(message));
-                unknowns.push(key);
-            }
-        }
-    }
+        .collect::<Vec<_>>();
     json!({
       "ok": true,
       "action": "runtime_probe_peer_direct_states",
-      "message": "Direct peer states updated",
-      "onlines": onlines,
-      "offlines": offlines,
-      "unknowns": unknowns,
-      "details": details
+      "message": "Direct probing is deprecated; Core owns LAN peer state",
+      "onlines": [],
+      "offlines": [],
+      "unknowns": unknowns
     })
     .to_string()
 }
@@ -2901,6 +2827,32 @@ pub fn runtime_remove_recent_peer(peer_id: String) -> String {
       "message": if removed { "Recent peer removed" } else { "Unable to remove recent peer" },
       "peerId": peer_id,
       "existed": existed,
+      "removed": removed
+    })
+    .to_string()
+}
+
+#[napi]
+pub fn runtime_remove_discovered_peer(peer_id: String) -> String {
+    let peer_id = peer_id.trim().to_string();
+    if peer_id.is_empty() {
+        return json!({
+          "ok": false,
+          "action": "runtime_remove_discovered_peer",
+          "message": "Peer id is empty"
+        })
+        .to_string();
+    }
+    flutter_ffi::main_remove_discovered(peer_id.clone());
+    let removed = hbb_common::config::LanPeers::load()
+        .peers
+        .iter()
+        .all(|peer| peer.id != peer_id);
+    json!({
+      "ok": removed,
+      "action": "runtime_remove_discovered_peer",
+      "message": if removed { "Discovered peer removed" } else { "Unable to remove discovered peer" },
+      "peerId": peer_id,
       "removed": removed
     })
     .to_string()
@@ -2960,230 +2912,48 @@ pub async fn runtime_scan_lan_peers() -> String {
         Err(_) => json!({
           "ok": false,
           "action": "runtime_scan_lan_peers",
-          "message": "LAN discovery worker stopped unexpectedly",
-          "pollAfterMs": 0,
-          "timeoutMs": 1000
+          "message": "LAN discovery worker stopped unexpectedly"
         })
         .to_string(),
     }
 }
 
 fn runtime_scan_lan_peers_blocking() -> String {
-    let _scan = lan_scan_execution_lock().lock().unwrap();
-    // A LAN address is volatile transport metadata. Start every explicit scan
-    // from an empty snapshot so an offline device cannot keep presenting an
-    // obsolete IP after DHCP/network changes.
-    let previous_peers = hbb_common::config::LanPeers::load().peers;
-    migrate_legacy_lan_passwords(&previous_peers);
-    let generation = LAN_SCAN_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    {
-        let mut resolution = lan_scan_resolution_store().lock().unwrap();
-        resolution.generation = 0;
-        resolution.ips.clear();
-        resolution.associated_recent_routes.clear();
-    }
-    hbb_common::config::LanPeers::store(&[]);
-    let recent_raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
-    let recent = parse_json_list(&recent_raw, "recent LAN candidates").unwrap_or_default();
-    // Flutter starts this same Core discovery routine in the background and
-    // consumes its load_lan_peers events. ArkTS has a request/response bridge,
-    // so run the identical Core routine on this worker and wait for its final
-    // snapshot instead of reimplementing PeerDiscovery in the HAR.
-    if let Err(message) = librustdesk::platform::ohos::discover_lan_blocking() {
-        return json!({
+    // Match Flutter: Core owns the persisted LAN snapshot and its merge rules.
+    // Flutter launches this same operation on a worker; the HAR worker calls
+    // it directly so its Promise resolves only after Core writes the snapshot.
+    match librustdesk::platform::ohos::discover_lan_blocking() {
+        Ok(()) => json!({
+          "ok": true,
+          "action": "runtime_scan_lan_peers",
+          "message": "LAN discovery completed"
+        })
+        .to_string(),
+        Err(error) => json!({
           "ok": false,
           "action": "runtime_scan_lan_peers",
-          "message": format!("LAN discovery failed: {message}"),
-          "pollAfterMs": 0,
-          "timeoutMs": 1000
+          "message": error.to_string()
         })
-        .to_string();
-    }
-    resolve_lan_preferred_ips(generation, &recent);
-    json!({
-      "ok": true,
-      "action": "runtime_scan_lan_peers",
-      "message": "LAN discovery completed",
-      "pollAfterMs": 0,
-      "timeoutMs": 1000
-    })
-    .to_string()
-}
-
-static LAN_SCAN_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-fn lan_scan_execution_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-}
-
-#[derive(Default)]
-struct LanScanResolution {
-    generation: u64,
-    ips: HashMap<String, String>,
-    associated_recent_routes: HashSet<(String, String)>,
-}
-
-fn lan_scan_resolution_store() -> &'static Mutex<LanScanResolution> {
-    static STORE: OnceLock<Mutex<LanScanResolution>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(LanScanResolution::default()))
-}
-
-fn resolve_lan_preferred_ips(generation: u64, recent: &[Value]) {
-    if LAN_SCAN_GENERATION.load(Ordering::Acquire) != generation {
-        return;
-    }
-    let peers = hbb_common::config::LanPeers::load().peers;
-    let mut resolved = HashMap::new();
-    let mut associated_recent_routes = HashSet::new();
-    for peer in &peers {
-        let mut discovered = peer.ip_mac.keys().cloned().collect::<Vec<_>>();
-        discovered.sort_by(|left, right| right.cmp(left));
-        discovered.dedup();
-        // Every ip_mac entry came from Core's completed Flutter discovery
-        // round. Keep all interfaces eligible, including VPN/mesh routes.
-        let reachable_discovered = discovered
-            .iter()
-            .find(|candidate| lan_direct_port_responds(candidate))
-            .cloned();
-        let mut recent_candidates = recent_lan_candidates(peer, recent);
-        recent_candidates.truncate(16);
-        let probed_recent = std::thread::scope(|scope| {
-            recent_candidates
-                .iter()
-                .cloned()
-                .map(|candidate| {
-                    scope.spawn(move || {
-                        let reachable = lan_direct_port_responds(&candidate);
-                        (candidate, reachable)
-                    })
-                })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .filter_map(|worker| worker.join().ok())
-                .collect::<Vec<_>>()
-        });
-        // A reachable recent address is session-only route metadata, not an
-        // authenticated identity fact. Use it only when exactly one candidate
-        // remains and its metadata has one owner in the completed Core snapshot.
-        let associated_candidates = probed_recent
-            .iter()
-            .filter(|(candidate, reachable)| {
-                *reachable && recent_route_owner_count(candidate, &peers, recent) == 1
-            })
-            .map(|(candidate, _)| candidate.clone())
-            .collect::<Vec<_>>();
-        let associated_recent =
-            (associated_candidates.len() == 1).then(|| associated_candidates[0].clone());
-        if let Some(candidate) = &associated_recent {
-            associated_recent_routes.insert((peer.id.clone(), candidate.clone()));
-        }
-        let preferred = associated_recent
-            .or(reachable_discovered)
-            .or_else(|| discovered.first().cloned());
-        if let Some(preferred) = preferred {
-            resolved.insert(peer.id.clone(), preferred);
-        }
-    }
-    if LAN_SCAN_GENERATION.load(Ordering::Acquire) != generation {
-        return;
-    }
-    let mut resolution = lan_scan_resolution_store().lock().unwrap();
-    if LAN_SCAN_GENERATION.load(Ordering::Acquire) == generation {
-        resolution.generation = generation;
-        resolution.ips = resolved;
-        resolution.associated_recent_routes = associated_recent_routes;
-    }
-}
-
-fn recent_lan_candidates(
-    peer: &hbb_common::config::DiscoveryPeer,
-    recent: &[Value],
-) -> Vec<String> {
-    let mut candidates = recent
-        .iter()
-        .filter_map(|row| {
-            let candidate = json_field_string(row, "id");
-            let address = IpAddr::from_str(&candidate).ok()?;
-            if address.is_unspecified() || address.is_loopback() || address.is_multicast() {
-                return None;
-            }
-            let recent_username = json_field_string(row, "username");
-            let recent_hostname = json_field_string(row, "hostname");
-            let username_match = !peer.username.is_empty() && peer.username == recent_username;
-            let hostname_match = !peer.hostname.is_empty() && peer.hostname == recent_hostname;
-            (username_match || hostname_match).then_some(candidate)
-        })
-        .collect::<Vec<_>>();
-    let mut seen = HashSet::new();
-    candidates.retain(|candidate| seen.insert(candidate.clone()));
-    candidates
-}
-
-fn recent_route_owner_count(
-    candidate: &str,
-    peers: &[hbb_common::config::DiscoveryPeer],
-    recent: &[Value],
-) -> usize {
-    peers
-        .iter()
-        .filter(|peer| {
-            recent_lan_candidates(peer, recent)
-                .iter()
-                .any(|address| address == candidate)
-        })
-        .count()
-}
-
-fn lan_direct_port_responds(ip: &str) -> bool {
-    let Ok(ip) = IpAddr::from_str(ip) else {
-        return false;
-    };
-    let target = SocketAddr::new(ip, hbb_common::config::WS_RENDEZVOUS_PORT as u16);
-    TcpStream::connect_timeout(&target, Duration::from_millis(250)).is_ok()
-}
-
-fn migrate_legacy_lan_passwords(peers: &[hbb_common::config::DiscoveryPeer]) {
-    for peer in peers {
-        if peer.id.is_empty() {
-            continue;
-        }
-        let mut stable_config = hbb_common::config::PeerConfig::load(&peer.id);
-        if !stable_config.password.is_empty() {
-            continue;
-        }
-        for ip in peer.ip_mac.keys() {
-            let legacy_config = hbb_common::config::PeerConfig::load(ip);
-            if !legacy_config.password.is_empty() {
-                stable_config.password = legacy_config.password;
-                stable_config.store(&peer.id);
-                break;
-            }
-        }
+        .to_string(),
     }
 }
 
 #[napi]
 pub fn runtime_list_lan_peers() -> String {
-    let raw =
-        serde_json::to_string(&hbb_common::config::LanPeers::load().peers).unwrap_or_default();
+    let raw = flutter_ffi::main_get_lan_peers();
     match parse_json_list(&raw, "LAN peer list") {
-        Ok(peers) => {
-            // Core inserts the newest discovery response first. Deduplicate by
-            // stable RustDesk ID so an older persisted row can never win in UI
-            // keyed rendering when username or address metadata changes.
-            let mut seen_ids = HashSet::new();
-            let recent_raw = flutter_ffi::main_load_recent_peers_for_ab("[]".to_string());
-            let recent = parse_json_list(&recent_raw, "recent LAN candidates").unwrap_or_default();
-            let peers = peers
-                .iter()
-                .filter(|peer| {
-                    let id = json_field_string(peer, "id");
-                    !id.is_empty() && seen_ids.insert(id)
-                })
-                .map(|peer| lan_peer_summary(peer, &recent))
-                .filter(|peer| !json_field_string(peer, "ip").is_empty())
-                .collect::<Vec<_>>();
+        Ok(mut peers) => {
+            for peer in &mut peers {
+                if let Value::Object(fields) = peer {
+                    let id = fields
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    fields.insert("targetId".to_string(), id.into());
+                }
+            }
             json!({
               "ok": true,
               "action": "runtime_list_lan_peers",
@@ -3250,7 +3020,7 @@ pub fn runtime_list_address_book_peers() -> String {
                         .map(|peers| {
                             peers
                                 .iter()
-                                .map(address_book_peer_summary)
+                                .filter_map(public_peer_record)
                                 .collect::<Vec<_>>()
                         })
                         .unwrap_or_default();
@@ -3699,18 +3469,6 @@ pub fn session_add(session_id: String, peer_target: String, options_json: String
     let core_session_id = make_core_session_id(&resolved_session_id);
     let force_relay = json_bool(&options, &["forceRelay", "force_relay"]);
     let normalized = normalize_target(&peer_target, force_relay);
-    if !librustdesk::common::is_direct_ip_access(&normalized.normalized_peer_id)
-        && normalized.custom_server.is_none()
-        && configured_id_server().is_empty()
-    {
-        return action_response(
-            "session_add",
-            false,
-            "Configure an ID server before connecting, or use an explicit id@server target"
-                .to_string(),
-            None,
-        );
-    }
     let conn_type = connection_type_from_options(&options).to_string();
     let view_only = conn_type == "default_conn"
         && json_bool(
@@ -7813,6 +7571,21 @@ fn address_book_peer(peer: &Value, include_hash: bool) -> Option<Value> {
     Some(Value::Object(result))
 }
 
+fn public_peer_record(peer: &Value) -> Option<Value> {
+    let mut peer = address_book_peer(peer, false)?;
+    if let Value::Object(fields) = &mut peer {
+        let id = fields
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        // Temporary additive compatibility for the previous ArkTS package. The value is the
+        // authoritative Core peer id, never an IP-derived alternate identity.
+        fields.insert("targetId".to_string(), id.into());
+    }
+    Some(peer)
+}
+
 fn normalize_tag_colors(raw: &str) -> String {
     serde_json::from_str::<Value>(raw)
         .ok()
@@ -8192,12 +7965,6 @@ fn start_address_book_sync_job() -> String {
 
 fn normalize_server_endpoint(value: String) -> String {
     value.trim().trim_end_matches('/').to_string()
-}
-
-fn configured_id_server() -> String {
-    flutter_ffi::main_get_option("custom-rendezvous-server".to_string())
-        .trim()
-        .to_string()
 }
 
 fn configured_api_server() -> String {
@@ -8611,142 +8378,6 @@ fn parse_json_list(raw: &str, name: &str) -> Result<Vec<Value>, String> {
         return Ok(Vec::new());
     }
     serde_json::from_str::<Vec<Value>>(raw).map_err(|err| format!("Invalid {}: {}", name, err))
-}
-
-fn recent_route_target_ids() -> HashMap<String, String> {
-    let mut target_ids = HashMap::new();
-    let resolution = lan_scan_resolution_store().lock().unwrap();
-    let generation = LAN_SCAN_GENERATION.load(Ordering::Acquire);
-    if generation != 0 && resolution.generation == generation {
-        // Never attach a Target ID to an IP-only recent row from persisted LAN
-        // cache. Only this process's completed explicit scan may establish the
-        // identity mapping used by online state and recent-card selection.
-        for peer in &hbb_common::config::LanPeers::load().peers {
-            for address in peer.ip_mac.keys() {
-                target_ids
-                    .entry(address.clone())
-                    .or_insert_with(|| peer.id.clone());
-            }
-        }
-        for (peer_id, address) in &resolution.associated_recent_routes {
-            target_ids.insert(address.clone(), peer_id.clone());
-        }
-    }
-    target_ids
-}
-
-fn recent_peer_summary(peer: &Value, target_ids: &HashMap<String, String>) -> Value {
-    let id = json_field_string(peer, "id");
-    let direct_ip = IpAddr::from_str(&id).is_ok();
-    let target_id = if direct_ip {
-        target_ids.get(&id).cloned().unwrap_or_default()
-    } else {
-        id.clone()
-    };
-    json!({
-      "id": id.clone(),
-      "targetId": target_id,
-      "username": json_field_string(peer, "username"),
-      "hostname": json_field_string(peer, "hostname"),
-      "platform": json_field_string(peer, "platform"),
-      "alias": json_field_string(peer, "alias"),
-      "ip": if direct_ip { json_field_string(peer, "id") } else { String::new() },
-      "hasStoredPassword": !json_field_string(peer, "hash").is_empty()
-    })
-}
-
-fn lan_peer_summary(peer: &Value, recent: &[Value]) -> Value {
-    let id = json_field_string(peer, "id");
-    json!({
-      "id": id.clone(),
-      "targetId": id,
-      "username": json_field_string(peer, "username"),
-      "hostname": json_field_string(peer, "hostname"),
-      "platform": json_field_string(peer, "platform"),
-      "online": peer.get("online").and_then(Value::as_bool).unwrap_or(false),
-      "ip": lan_peer_ip(peer, recent),
-      "ipMac": json_object_field(peer, "ip_mac")
-    })
-}
-
-fn lan_peer_ip(peer: &Value, recent: &[Value]) -> String {
-    let id = json_field_string(peer, "id");
-    // Once an explicit refresh has started, expose only an address that was
-    // discovered and reached during that same generation. The resolution lock
-    // and generation check make refresh/list linearizable: no prior generation
-    // can leak an old recent-session IP while a new scan is in progress.
-    let resolution = lan_scan_resolution_store().lock().unwrap();
-    let generation = LAN_SCAN_GENERATION.load(Ordering::Acquire);
-    if generation != 0 {
-        if resolution.generation != generation {
-            return String::new();
-        }
-        if let Some(preferred) = resolution.ips.get(&id) {
-            let still_discovered = peer
-                .get("ip_mac")
-                .and_then(Value::as_object)
-                .is_some_and(|addresses| addresses.contains_key(preferred));
-            if still_discovered
-                || resolution
-                    .associated_recent_routes
-                    .contains(&(id.clone(), preferred.clone()))
-            {
-                return preferred.clone();
-            }
-        }
-        return String::new();
-    }
-    drop(resolution);
-    let mut addresses = peer
-        .get("ip_mac")
-        .and_then(Value::as_object)
-        .map(|entries| {
-            entries
-                .keys()
-                .filter_map(|value| IpAddr::from_str(value).ok())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    addresses.sort_unstable_by_key(|address| (!address.is_ipv4(), *address));
-    let username = json_field_string(peer, "username");
-    let hostname = json_field_string(peer, "hostname");
-    if let Some(recent_address) = recent.iter().find_map(|row| {
-        let candidate = IpAddr::from_str(&json_field_string(row, "id")).ok()?;
-        if !addresses.contains(&candidate) {
-            return None;
-        }
-        let recent_username = json_field_string(row, "username");
-        let recent_hostname = json_field_string(row, "hostname");
-        ((!username.is_empty() && username == recent_username)
-            || (!hostname.is_empty() && hostname == recent_hostname))
-            .then_some(candidate)
-    }) {
-        return recent_address.to_string();
-    }
-    // Multi-homed peers can answer the same discovery scan from multiple LAN
-    // addresses. Prefer the highest IPv4 candidate when no previously working
-    // recent-session address identifies the route; this avoids deterministically
-    // selecting the oldest/lowest DHCP address from the map.
-    addresses
-        .iter()
-        .rev()
-        .find(|address| address.is_ipv4())
-        .or_else(|| addresses.first())
-        .map(ToString::to_string)
-        .unwrap_or_default()
-}
-
-fn address_book_peer_summary(peer: &Value) -> Value {
-    let id = json_field_string(peer, "id");
-    json!({
-      "id": id.clone(),
-      "targetId": id,
-      "username": json_field_string(peer, "username"),
-      "hostname": json_field_string(peer, "hostname"),
-      "platform": json_field_string(peer, "platform"),
-      "alias": json_field_string(peer, "alias"),
-      "tags": json_array_field(peer, "tags")
-    })
 }
 
 fn normalize_target(peer_target: &str, force_relay: bool) -> NormalizedPeerTarget {
