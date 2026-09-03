@@ -244,7 +244,40 @@ jobs:
           umask 077
           printf '%s' "$CODEARTS_PRIVATE_OHPM" > "$private_config"
           trap 'rm -f "$private_config"' EXIT
-          ohpm publish --publish_registry "$CODEARTS_OHPM_REGISTRY" release/package.har
+          published=false
+          for attempt in 1 2 3; do
+            if ohpm info "$PACKAGE_NAME@$PACKAGE_VERSION" \
+              --registry "$CODEARTS_OHPM_REGISTRY" \
+              --fetch_timeout 30000 >/dev/null 2>&1; then
+              echo "$PACKAGE_NAME@$PACKAGE_VERSION is already available in CodeArts."
+              published=true
+              break
+            fi
+
+            echo "Publishing $PACKAGE_NAME@$PACKAGE_VERSION (attempt $attempt/3)."
+            if ohpm publish --publish_registry "$CODEARTS_OHPM_REGISTRY" release/package.har; then
+              published=true
+              break
+            fi
+
+            # A timed-out upload may still have completed server-side. Check the immutable
+            # version before retrying so a duplicate-version response does not fail the run.
+            if ohpm info "$PACKAGE_NAME@$PACKAGE_VERSION" \
+              --registry "$CODEARTS_OHPM_REGISTRY" \
+              --fetch_timeout 30000 >/dev/null 2>&1; then
+              echo "$PACKAGE_NAME@$PACKAGE_VERSION became available after the publish error."
+              published=true
+              break
+            fi
+
+            if (( attempt < 3 )); then
+              sleep $((attempt * 15))
+            fi
+          done
+          if [[ "$published" != true ]]; then
+            echo "Failed to publish $PACKAGE_NAME@$PACKAGE_VERSION after 3 attempts." >&2
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/core-published"
           printf '%s\n' "$CORE_SHA" > "$RUNNER_TEMP/core-published/sha"
           printf 'Published `%s@%s` from Core `%s` and HAR `%s`.\n' \
